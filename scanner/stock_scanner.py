@@ -1,19 +1,9 @@
 import logging
 import pandas as pd
 import yfinance as yf
+from alerts.telegram import send_telegram
+from utils.retry import retry_download
 from ta.trend import ADXIndicator
-import os
-import sys
-
-# --- Dynamic Path Setup to Access watchlist ---
-current = os.path.abspath(os.path.dirname(__file__))
-project_root = os.path.abspath(os.path.join(current, '..'))  # go one level up from 'scanner'
-sys.path.insert(0, project_root)
-
-from watchlist.nifty_stocks import watchlist
-
-# --- Remove symbols that repeatedly fail to load ---
-watchlist = [sym for sym in watchlist if sym not in ['ADANITRANS.NS', 'GMRINFRA.NS', 'LAXMIMACH.NS', 'MAHINDCIE.NS']]
 
 # --- Helper Functions ---
 
@@ -36,7 +26,9 @@ def compute_macd(series: pd.Series):
 
 def check_bb_challenge(series: pd.Series) -> bool:
     rolling_mean = series.rolling(window=20).mean()
-    return series.iloc[-1] > rolling_mean.iloc[-1]
+    rolling_std = series.rolling(window=20).std()
+    upper = rolling_mean + (2 * rolling_std)
+    return series.iloc[-1] > upper.iloc[-1]
 
 def check_macd_status(macd: pd.Series, signal: pd.Series):
     latest = macd.iloc[-1] - signal.iloc[-1]
@@ -70,11 +62,7 @@ def compute_adx(high: pd.Series, low: pd.Series, close: pd.Series):
 def detect_rsi_divergence(price: pd.Series, rsi: pd.Series) -> str:
     return "None"
 
-def check_stochastic_pco(close: pd.Series) -> bool:
-    low_14 = close.rolling(window=14).min()
-    high_14 = close.rolling(window=14).max()
-    k_percent = 100 * ((close - low_14) / (high_14 - low_14))
-    return k_percent.iloc[-1] > k_percent.iloc[-2] and k_percent.iloc[-2] < 20
+# --- Result Formatting and Scanning Logic ---
 
 def format_result_block(results: list[dict], signal_type: str) -> str:
     lines = []
@@ -90,34 +78,19 @@ def format_result_block(results: list[dict], signal_type: str) -> str:
             f"   💥 Volume Spike  : {'Yes' if r['Volume Spike'] else 'No'}\n"
             f"   😽 ADX Strength  : {r['ADX']:.2f}\n"
             f"   🔍 RSI Divergence: {r['RSI Divergence']}\n"
-            f"   🔮 SOBBO         : {r['SOBBO']}\n"
-            f"   📉 Stoch. PCO    : {'Yes' if r['Stochastic PCO'] else 'No'}\n"
         )
     return f"\n\n{signal_type} Signals:\n" + "\n".join(lines)
 
-def retry_download(symbol: str, period: str, interval: str) -> pd.DataFrame:
-    for _ in range(3):
-        try:
-            df = yf.download(symbol, period=period, interval=interval, progress=False)
-            if not df.empty:
-                return df
-        except Exception:
-            continue
-    return pd.DataFrame()
-
 def run_stock_scan(symbols: list[str], send_alerts: bool = False):
     all_results = []
-    skipped_symbols = []
 
     for sym in symbols:
         try:
             df = retry_download(sym, "6mo", "1d")
             if df.empty or df.shape[0] < 60:
-                skipped_symbols.append(sym)
                 continue
 
             if df[['Open', 'High', 'Low', 'Close', 'Volume']].isnull().any().any():
-                skipped_symbols.append(sym)
                 continue
 
             open_ = df['Open'].squeeze()
@@ -133,7 +106,6 @@ def run_stock_scan(symbols: list[str], send_alerts: bool = False):
 
             df_week = retry_download(sym, "1y", "1wk")
             if df_week is None or df_week.shape[0] < 26:
-                skipped_symbols.append(sym)
                 continue
             macd_tide, signal_tide, _ = compute_macd(df_week["Close"].squeeze())
 
@@ -146,9 +118,6 @@ def run_stock_scan(symbols: list[str], send_alerts: bool = False):
             vol_spike = check_volume_spike(volume)
             adx_val = compute_adx(high, low, close)
             rsi_div = detect_rsi_divergence(close, rsi)
-            stochastic_pco = check_stochastic_pco(close)
-
-            sobbo = "Yes" if close.iloc[-1] > close.iloc[-5:-1].min() * 1.02 else "No"
 
             if bb and trend.startswith("Trend") and macd_wave_status == macd_tide_status:
                 all_results.append({
@@ -164,13 +133,10 @@ def run_stock_scan(symbols: list[str], send_alerts: bool = False):
                     "Volume Spike": vol_spike,
                     "ADX": adx_val,
                     "RSI Divergence": rsi_div,
-                    "Bias": macd_wave_status if macd_wave_status == macd_tide_status else "Neutral",
-                    "SOBBO": sobbo,
-                    "Stochastic PCO": stochastic_pco
+                    "Bias": macd_wave_status if macd_wave_status == macd_tide_status else "Neutral"
                 })
 
-        except Exception:
-            skipped_symbols.append(sym)
+        except Exception as e:
             continue
 
     if all_results:
@@ -180,15 +146,17 @@ def run_stock_scan(symbols: list[str], send_alerts: bool = False):
         if bullish:
             msg = format_result_block(bullish, "📈 Bullish")
             print(msg)
+            if send_alerts:
+                send_telegram(msg)
 
         if bearish:
             msg = format_result_block(bearish, "📉 Bearish")
             print(msg)
-
-    if skipped_symbols:
-        print(f"\n❌ Skipped {len(skipped_symbols)} symbols (no data or delisted): {skipped_symbols}\n")
+            if send_alerts:
+                send_telegram(msg)
 
 # --- Trigger the scan if needed ---
 
 if __name__ == "__main__":
-    run_stock_scan(watchlist, send_alerts=False)
+    from watchlist.nifty_stocks import watchlist
+    run_stock_scan(watchlist, send_alerts=True)
