@@ -132,15 +132,15 @@ def format_result_block(results: list[dict], signal_type: str) -> str:
     for r in results:
         lines.append(
             f"{r['Symbol']} ({r['Bias']}):\n"
-            f"   📉 Price         : ₹{r['Price']:.2f}\n"
-            f"   🎯 BB Challenge  : {r['BB Challenge']}\n" # This now outputs string
-            f"   💡 MACD (Wave)   : {r['MACD Wave']} ({'>0' if r['MACD Wave > 0'] else '<0'})\n"
-            f"   🌊 MACD (Tide)   : {r['MACD Tide']} ({'>0' if r['MACD Tide > 0'] else '<0'})\n"
-            f"   🔄 EMA 5/50 Xover: {r['Crossover']}\n"
-            f"   📈 Trend Line    : {r['Trend']}\n" # This now outputs string
-            f"   💥 Volume Spike  : {'Yes' if r['Volume Spike'] else 'No'}\n"
-            f"   😽 ADX Strength  : {r['ADX']:.2f}\n"
-            f"   🔍 RSI Divergence: {r['RSI Divergence']}\n"
+            f"    📉 Price         : ₹{r['Price']:.2f}\n"
+            f"    🎯 BB Challenge   : {r['BB Challenge']}\n" # This now outputs string
+            f"    💡 MACD (Wave)    : {r['MACD Wave']} ({'>0' if r['MACD Wave > 0'] else '<0'})\n"
+            f"    🌊 MACD (Tide)    : {r['MACD Tide']} ({'>0' if r['MACD Tide > 0'] else '<0'})\n"
+            f"    🔄 EMA 5/50 Xover: {r['Crossover']}\n"
+            f"    📈 Trend Line     : {r['Trend']}\n" # This now outputs string
+            f"    💥 Volume Spike   : {'Yes' if r['Volume Spike'] else 'No'}\n"
+            f"    😽 ADX Strength   : {r['ADX']:.2f}\n"
+            f"    🔍 RSI Divergence: {r['RSI Divergence']}\n"
         )
     return f"\n\n{signal_type} Signals:\n" + "\n".join(lines)
 
@@ -213,11 +213,6 @@ def run_stock_scan(symbols: list[str], send_alerts: bool = False):
 
     for r in all_potential_signals:
         # Define strong bullish conditions.
-        # A stock is considered bullish if it meets a combination of these criteria:
-        # 1. Price is challenging upper BB AND is in a bullish trend breakout AND both MACDs are positive crossover.
-        # 2. EMA crossover is bullish AND both MACDs are positive crossover.
-        # 3. Price is challenging upper BB AND EMA crossover is bullish.
-        # You can adjust these combinations to make signals more or less strict.
         is_bullish = False
         if (r['BB Challenge'] == "Upper BB Challenge" and
             r['Trend'] == "Bullish Trend BO" and
@@ -229,10 +224,7 @@ def run_stock_scan(symbols: list[str], send_alerts: bool = False):
         elif (r['BB Challenge'] == "Upper BB Challenge" and
               r['Crossover'] == "Bullish"):
             is_bullish = True
-        # Consider adding volume spike as a confirming signal for stronger breakouts
-        # if is_bullish and r['Volume Spike']:
-        #    # Stronger bullish signal
-
+        
         # Define strong bearish conditions (inverse logic of bullish)
         is_bearish = False
         if (r['BB Challenge'] == "Lower BB Challenge" and
@@ -245,17 +237,15 @@ def run_stock_scan(symbols: list[str], send_alerts: bool = False):
         elif (r['BB Challenge'] == "Lower BB Challenge" and
               r['Crossover'] == "Bearish"):
             is_bearish = True
-        # if is_bearish and r['Volume Spike']:
-        #    # Stronger bearish signal
 
-        # Assign bias based on the determined conditions
-        if is_bullish and not is_bearish: # Must be clearly bullish, not also bearish
+        # Assign bias based on the determined conditions and ADX filter
+        if is_bullish and not is_bearish and r['ADX'] >= 12: # MODIFIED LINE
             r['Bias'] = 'PCO' # Positive bias
             bullish_final_signals.append(r)
-        elif is_bearish and not is_bullish: # Must be clearly bearish, not also bullish
+        elif is_bearish and not is_bullish and r['ADX'] >= 12: # MODIFIED LINE
             r['Bias'] = 'NCO' # Negative bias
             bearish_final_signals.append(r)
-        # If neither or both (contradictory), the bias remains "Neutral" and is not added to the lists.
+        # If neither, both, or ADX is too low, the bias remains "Neutral" and is not added.
 
     if bullish_final_signals:
         msg = format_result_block(bullish_final_signals, "📈 Bullish")
