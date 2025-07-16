@@ -92,7 +92,7 @@ def format_result_block(results: list[dict], signal_type: str) -> str:
     for r in results:
         lines.append(
             f"{r['Symbol']} ({r['Bias']}):\n"
-            f"    📉 PriceRaj         : ₹{r['Price']:.2f}\n"
+            f"    📉 Price         : ₹{r['Price']:.2f}\n"
             f"    🎯 BB Challenge   : {r['BB Challenge']}\n"
             f"    💡 MACD (Wave)    : {r['MACD Wave']} ({'>0' if r['MACD Wave > 0'] else '<0'})\n"
             f"    🌊 MACD (Tide)    : {r['MACD Tide']} ({'>0' if r['MACD Tide > 0'] else '<0'})\n"
