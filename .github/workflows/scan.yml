@@ -18,14 +18,9 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 25
-
     env:
       PYTHONUNBUFFERED: "1"
       PYTHONPATH: ${{ github.workspace }}
-      # If your scanner uses Telegram or other API keys, set them in
-      # Settings → Secrets and variables → Actions, then uncomment:
-      # TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      # TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
     steps:
       - name: Checkout
@@ -45,21 +40,25 @@ jobs:
       - name: Run scanner
         run: |
           mkdir -p scanner/output
-          # If your script supports --out, write a file we can upload:
-          python scanner/stock_scanner.py --out scanner/output/latest.json || python scanner/stock_scanner.py
+          python scanner/stock_scanner.py
 
-      - name: Write run summary
+      # ✅ NEW: write results into the Run Summary so I can read them directly
+      - name: Show results in Summary
         run: |
-          echo "## 🧠 Scan Summary" >> $GITHUB_STEP_SUMMARY
-          # If your script supports a markdown summary flag, use it:
-          if python scanner/stock_scanner.py --summary-md >> $GITHUB_STEP_SUMMARY 2>/dev/null; then
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "_Rendered from --summary-md output_" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "_No --summary-md support detected. Showing last 200 lines of logs:_" >> $GITHUB_STEP_SUMMARY
+          echo "## 📊 Scan Results" >> $GITHUB_STEP_SUMMARY
+          if [ -f scanner/output/latest.txt ]; then
             echo '```' >> $GITHUB_STEP_SUMMARY
-            tail -n 200 "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "Add --summary-md to your script for richer summaries."
+            cat scanner/output/latest.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          elif [ -f scanner/output/latest.json ]; then
+            echo '```json' >> $GITHUB_STEP_SUMMARY
+            cat scanner/output/latest.json >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "_No output files found in scanner/output/ (printing last 120 log lines)_" >> $GITHUB_STEP_SUMMARY
+            echo '' >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            tail -n 120 "$GITHUB_WORKSPACE"/* 2>/dev/null || echo "No extra logs captured."
             echo '```' >> $GITHUB_STEP_SUMMARY
           fi
 
@@ -69,4 +68,3 @@ jobs:
           name: scan-results
           path: scanner/output/*
           if-no-files-found: warn
-
