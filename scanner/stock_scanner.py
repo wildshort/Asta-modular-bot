@@ -200,17 +200,17 @@ def run_stock_scan(symbols: list[str], send_alerts: bool = False):
     if bullish:
         msg = format_result_block(bullish, "📈 Bullish")
         print(msg)
-        if send_alerts:
+        #if send_alerts:
             send_telegram(msg)
     if bearish:
         msg = format_result_block(bearish, "📉 Bearish")
         print(msg)
-        if send_alerts:
+        #if send_alerts:
             send_telegram(msg)
 
 
 if __name__ == "__main__":
     from watchlist.nifty_stocks import watchlist
     logging.info("⏳ Market scanner starting now...")
-    run_stock_scan(watchlist, send_alerts=True)
+    run_stock_scan(watchlist, send_alerts=False)
     logging.info("✅ One-time scan complete. Check logs and Telegram.")
