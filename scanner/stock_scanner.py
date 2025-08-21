@@ -1,3 +1,5 @@
+import os
+import json
 import logging
 import pandas as pd
 import yfinance as yf
@@ -196,19 +198,45 @@ def run_stock_scan(symbols: list[str], send_alerts: bool = False):
             bearish.append(r)
             logging.info(f"🔕 Bearish → {r['Symbol']}")
 
-    # Output results
+        # Output results (console)
     if bullish:
         msg = format_result_block(bullish, "📈 Bullish")
         print(msg)
-        #if send_alerts:
-            send_telegram(msg)
+        # Telegram disabled during testing
+        # if send_alerts:
+        #     send_telegram(msg)
+
     if bearish:
         msg = format_result_block(bearish, "📉 Bearish")
         print(msg)
-        #if send_alerts:
-            send_telegram(msg)
+        # Telegram disabled during testing
+        # if send_alerts:
+        #     send_telegram(msg)
 
+    # --- Always write artifact-friendly outputs ---
+    try:
+        os.makedirs("scanner/output", exist_ok=True)
 
+        # Compact machine-readable summary
+        summary = {
+            "bullish": [r["Symbol"] for r in bullish],
+            "bearish": [r["Symbol"] for r in bearish],
+            "counts": {"bullish": len(bullish), "bearish": len(bearish)}
+        }
+        with open("scanner/output/latest.json", "w") as f:
+            json.dump(summary, f, indent=2)
+
+        # Optional: simple text list (handy to open in Actions UI)
+        with open("scanner/output/latest.txt", "w") as f:
+            f.write("Bullish:\n")
+            for s in summary["bullish"]:
+                f.write(f"- {s}\n")
+            f.write("\nBearish:\n")
+            for s in summary["bearish"]:
+                f.write(f"- {s}\n")
+
+    except Exception as e:
+        logging.error(f"Failed to write artifacts: {e}", exc_info=True)
 if __name__ == "__main__":
     from watchlist.nifty_stocks import watchlist
     logging.info("⏳ Market scanner starting now...")
