@@ -198,18 +198,18 @@ def run_stock_scan(symbols: list[str], send_alerts: bool = False):
             bearish.append(r)
             logging.info(f"🔕 Bearish → {r['Symbol']}")
 
-        # Output results (console)
+    # Output results (console)
     if bullish:
         msg = format_result_block(bullish, "📈 Bullish")
         print(msg)
-          if send_alerts:
-             send_telegram(msg)
+        if send_alerts:
+            send_telegram(msg)
 
     if bearish:
         msg = format_result_block(bearish, "📉 Bearish")
         print(msg)
-         if send_alerts:
-             send_telegram(msg)
+        if send_alerts:
+            send_telegram(msg)
 
     # --- Always write artifact-friendly outputs ---
     try:
@@ -235,6 +235,7 @@ def run_stock_scan(symbols: list[str], send_alerts: bool = False):
 
     except Exception as e:
         logging.error(f"Failed to write artifacts: {e}", exc_info=True)
+
 if __name__ == "__main__":
     from watchlist.nifty_stocks import watchlist
     logging.info("⏳ Market scanner starting now...")
