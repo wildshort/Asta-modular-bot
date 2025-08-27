@@ -202,14 +202,12 @@ def run_stock_scan(symbols: list[str], send_alerts: bool = False):
     if bullish:
         msg = format_result_block(bullish, "📈 Bullish")
         print(msg)
-         Telegram disabled during testing
           if send_alerts:
              send_telegram(msg)
 
     if bearish:
         msg = format_result_block(bearish, "📉 Bearish")
         print(msg)
-        Telegram disabled during testing
          if send_alerts:
              send_telegram(msg)
 
