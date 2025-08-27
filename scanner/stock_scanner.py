@@ -202,16 +202,16 @@ def run_stock_scan(symbols: list[str], send_alerts: bool = False):
     if bullish:
         msg = format_result_block(bullish, "📈 Bullish")
         print(msg)
-        # Telegram disabled during testing
-        # if send_alerts:
-        #     send_telegram(msg)
+         Telegram disabled during testing
+         if send_alerts:
+             send_telegram(msg)
 
     if bearish:
         msg = format_result_block(bearish, "📉 Bearish")
         print(msg)
-        # Telegram disabled during testing
-        # if send_alerts:
-        #     send_telegram(msg)
+        Telegram disabled during testing
+         if send_alerts:
+             send_telegram(msg)
 
     # --- Always write artifact-friendly outputs ---
     try:
@@ -240,5 +240,5 @@ def run_stock_scan(symbols: list[str], send_alerts: bool = False):
 if __name__ == "__main__":
     from watchlist.nifty_stocks import watchlist
     logging.info("⏳ Market scanner starting now...")
-    run_stock_scan(watchlist, send_alerts=False)
+    run_stock_scan(watchlist, send_alerts=True)
     logging.info("✅ One-time scan complete. Check logs and Telegram.")
