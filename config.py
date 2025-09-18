@@ -3,7 +3,7 @@ import datetime
 import os
 
 # ✅ Telegram Bot Details
-TELEGRAM_TOKEN = "7687060477:AAHd9efwSb2oXiZeo-aOGYXviCZVAf1JiEY
+TELEGRAM_TOKEN = "7687060477:AAHd9efwSb2oXiZeo-aOGYXviCZVAf1JiEY"
 CHAT_ID = -1002737768405
 # Watchlist
 WATCHLIST = [
