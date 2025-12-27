@@ -1,109 +1,9 @@
 import logging
 from datetime import datetime
 from scanner.stock_scanner import run_stock_scan
+# ✅ Import the centralized watchlist from config
+from config import WATCHLIST 
 
-# 📋 Full watchlist: NIFTY 50 + Next 50 + Midcap 50 (GMRINFRA, REC removed)
-watchlist = [
-    # Private Banks
-    "AUBANK.NS", "AXISBANK.NS", "BANDHANBNK.NS", "FEDERALBNK.NS",
-    "HDFCBANK.NS", "ICICIBANK.NS", "IDFCFIRSTB.NS", "INDUSINDBK.NS",
-    "KOTAKBANK.NS", "RBLBANK.NS", "YESBANK.NS",
-
-    # PSU Banks
-    "BANKBARODA.NS", "BANKINDIA.NS", "MAHABANK.NS", "CANBK.NS",
-    "CENTRALBK.NS", "INDIANB.NS", "IOB.NS", "PSB.NS",
-    "PNB.NS", "SBIN.NS", "UCOBANK.NS", "UNIONBANK.NS",
-
-    # Financial Services
-    "BAJFINANCE.NS", "HDFCLIFE.NS", "SBILIFE.NS", "BAJAJFINSV.NS",
-    "ICICIGI.NS", "ICICIPRULI.NS", "IRFC.NS", "MUTHOOTFIN.NS",
-    "MANAPPURAM.NS", "RECLTD.NS", "SUNDARMFIN.NS", "IIFL.NS", "LICI.NS",
-
-    # Information Technology
-    "TCS.NS", "INFY.NS", "WIPRO.NS", "TECHM.NS",
-    "COFORGE.NS", "LTIM.NS", "MPHASIS.NS",
-
-    # Healthcare / Pharma
-    "ABBOTINDIA.NS", "AJANTPHARM.NS", "ALKEM.NS", "AUROPHARMA.NS",
-    "BIOCON.NS", "CIPLA.NS", "DIVISLAB.NS", "DRREDDY.NS",
-    "GLAND.NS", "GLENMARK.NS", "GRANULES.NS", "IPCALAB.NS",
-    "JBCHEPHARM.NS", "LAURUSLABS.NS", "LUPIN.NS", "MANKIND.NS",
-    "NATCOPHARM.NS", "TORNTPHARM.NS",
-
-    # FMCG
-    "BRITANNIA.NS", "COLPAL.NS", "DABUR.NS", "EMAMILTD.NS",
-    "GODREJCP.NS", "HINDUNILVR.NS", "ITC.NS", "MARICO.NS",
-    "NESTLEIND.NS", "PATANJALI.NS", "RADICO.NS", "TATACONSUM.NS",
-    "UBL.NS", "VBL.NS", "PIDILITIND.NS",
-
-    # Retail / Consumer Discretionary
-    "DMART.NS",
-
-    # Auto & Auto Components
-    "ASHOKLEY.NS", "BAJAJ-AUTO.NS", "BALKRISIND.NS", "BHARATFORG.NS",
-    "BOSCHLTD.NS", "EICHERMOT.NS", "EXIDEIND.NS", "HEROMOTOCO.NS",
-    "MRF.NS", "M&M.NS", "MARUTI.NS",
-    # (removed MOTHERSUMI.NS)
-
-    "TVSMOTOR.NS", "TATAMOTORS.NS", "TIINDIA.NS", "ESCORTS.NS",
-
-    # Metals & Mining
-    "APLAPOLLO.NS", "ADANIENT.NS", "HINDALCO.NS", "HINDCOPPER.NS",
-    "HINDZINC.NS", "JSWSTEEL.NS", "JSL.NS", "JINDALSTEL.NS",
-    # (removed LLOYDSMES.NS)
-    "NMDC.NS", "NATIONALUM.NS", "SAIL.NS",
-    "TATASTEEL.NS", "VEDL.NS", "WELCORP.NS",
-
-    # Power & Utilities
-    "NTPC.NS", "POWERGRID.NS", "NHPC.NS",
-
-    # Oil & Gas
-    "RELIANCE.NS", "ONGC.NS", "IOC.NS", "GAIL.NS", "BPCL.NS", "COALINDIA.NS",
-
-    # Capital Goods
-    "LT.NS", "SIEMENS.NS", "ABB.NS", "BEL.NS", "BHEL.NS", "CUMMINSIND.NS", "HAL.NS",
-
-    # Consumer Durables
-    "TITAN.NS", "VOLTAS.NS", "HAVELLS.NS", "WHIRLPOOL.NS",
-    "BATAINDIA.NS", "PAGEIND.NS", "PEL.NS",
-
-    # Telecom
-    "BHARTIARTL.NS", "IDEA.NS",
-
-    # Media
-    "DBCORP.NS", "DISHTV.NS", "HATHWAY.NS", "NAZARA.NS",
-    "NETWORK18.NS", "PVRINOX.NS",
-    # (removed PVR.NS)
-    "SAREGAMA.NS", "SUNTV.NS", "TIPSMUSIC.NS", "ZEEL.NS",
-
-    # Realty
-    "ANANTRAJ.NS", "BRIGADE.NS", "DLF.NS", "GODREJPROP.NS",
-    "LODHA.NS", "OBEROIRLTY.NS", "PHOENIXLTD.NS", "PRESTIGE.NS",
-    "RAYMOND.NS", "SOBHA.NS",
-
-    # Infrastructure
-    "ADANIGREEN.NS", "ADANIPORTS.NS", "AMBUJACEM.NS", "APOLLOHOSP.NS",
-    "ASHOKLEY.NS", "BHARATFORG.NS", "BPCL.NS", "BHARTIARTL.NS",
-    "CGPOWER.NS", "CUMMINSIND.NS", "DLF.NS", "GAIL.NS",
-    "GODREJPROP.NS", "GRASIM.NS", "HINDPETRO.NS", "INDHOTEL.NS", "IOC.NS",
-
-    # Energy
-    "ABB.NS", "ADANIGREEN.NS", "ADANIENT.NS", "ADANIPOWER.NS",
-    "ATGL.NS", "AEGISLOG.NS", "BHEL.NS", "BPCL.NS", "CESC.NS",
-    "CGPOWER.NS", "CASTROLIND.NS", "COALINDIA.NS", "GAIL.NS",
-    # (removed GET&D.NS)
-    "GUJGASLTD.NS", "GSPL.NS", "HINDPETRO.NS", "POWERINDIA.NS",
-
-    # Exchanges / Capital Markets Infrastructure
-    "BSE.NS", "MCX.NS", "CDSL.NS",
-
-    # Others (from old Next/Midcap lists)
-    "ADANIENSOL.NS", "INDIGO.NS", "NAUKRI.NS",
-    "SHREECEM.NS", "TRENT.NS",
-
-    # Commodity
-    "GC=F","SI=F","NG=F","HG=F","MGC=F","SIL=F","QG=F"
-]
 # 🧾 Setup logging
 log_file = f"logs/market_scan_{datetime.now().strftime('%Y-%m-%d')}.log"
 logging.basicConfig(
@@ -117,7 +17,7 @@ logging.basicConfig(
 
 print("⏳ Market scanner starting now...")
 
-# 🔁 Run scan
-run_stock_scan(watchlist)
+# 🔁 Run scan with ALERTS ENABLED
+run_stock_scan(WATCHLIST, send_alerts=True)
 
 print("✅ One-time scan complete. Check logs and Telegram.")
