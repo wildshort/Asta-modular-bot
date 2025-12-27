@@ -9,6 +9,10 @@ import pandas as pd
 import yfinance as yf
 from config import TELEGRAM_TOKEN, CHAT_ID
 
+# --- CONFIGURATION ---
+# Set to "6mo" for wider, cleaner candles. Set to "1y" for more history.
+CHART_PERIOD = "6mo" 
+
 # --- HELPER: Indicator Calculations ---
 def calculate_indicators(df):
     """Calculates EMA, RSI, MACD, and Bollinger Bands."""
@@ -39,11 +43,8 @@ def calculate_indicators(df):
     return df
 
 def get_trendline_points(df):
-    """
-    Identifies trendlines using integer indices (0 to N) instead of dates.
-    """
+    """Identifies trendlines using integer indices (gapless)."""
     df = df.copy()
-    # Create integer index for calculation
     df['idx'] = range(len(df))
     
     # Identify Pivots
@@ -59,24 +60,21 @@ def get_trendline_points(df):
     if len(highs) >= 2:
         x1, y1 = highs['idx'].iloc[-2], highs['High'].iloc[-2]
         x2, y2 = highs['idx'].iloc[-1], highs['High'].iloc[-1]
-        
         if x2 != x1:
             slope = (y2 - y1) / (x2 - x1)
-            # Extend to end of chart
             x_ext = df['idx'].iloc[-1]
             y_ext = y1 + slope * (x_ext - x1)
-            lines.append({'x': [x1, x_ext], 'y': [y1, y_ext], 'color': 'purple', 'label': 'Resist'}) # Purple like TradingView
+            lines.append({'x': [x1, x_ext], 'y': [y1, y_ext], 'color': '#9C27B0', 'label': 'Resist'})
 
     # Support
     if len(lows) >= 2:
         x1, y1 = lows['idx'].iloc[-2], lows['Low'].iloc[-2]
         x2, y2 = lows['idx'].iloc[-1], lows['Low'].iloc[-1]
-        
         if x2 != x1:
             slope = (y2 - y1) / (x2 - x1)
             x_ext = df['idx'].iloc[-1]
             y_ext = y1 + slope * (x_ext - x1)
-            lines.append({'x': [x1, x_ext], 'y': [y1, y_ext], 'color': 'purple', 'label': 'Support'})
+            lines.append({'x': [x1, x_ext], 'y': [y1, y_ext], 'color': '#9C27B0', 'label': 'Support'})
         
     return lines
 
@@ -91,14 +89,14 @@ def send_telegram(message: str):
         logging.warning(f"⚠️ Telegram send failed: {e}")
 
 def send_chart(symbol: str):
-    """Generates a TradingView-style chart using Index-Based plotting."""
+    """Generates a High-Def TradingView Style Chart."""
     if not TELEGRAM_TOKEN or not CHAT_ID:
         return
 
     try:
         # 1. Fetch Data
         ticker = f"{symbol}" if ".NS" in symbol or "=" in symbol else f"{symbol}.NS"
-        df = yf.download(ticker, period="1y", interval="1d", progress=False)
+        df = yf.download(ticker, period=CHART_PERIOD, interval="1d", progress=False)
         
         if df.empty:
             logging.warning(f"⚠️ No chart data for {symbol}")
@@ -110,109 +108,101 @@ def send_chart(symbol: str):
         # 2. Prepare Data
         df = calculate_indicators(df)
         trendlines = get_trendline_points(df)
-        
-        # Reset index to get 0..N integer range for gapless plotting
         df_plot = df.reset_index()
         
-        # Title Stats
+        # Stats for Title
         last_price = df['Close'].iloc[-1]
         prev_price = df['Close'].iloc[-2]
         pct_change = ((last_price - prev_price) / prev_price) * 100
         color_arrow = "🟢" if pct_change >= 0 else "🔴"
 
-        # 3. Setup Layout
-        # WIDER Figure (16x12) to reduce congestion
-        fig = plt.figure(figsize=(16, 12), facecolor='white') 
-        gs = gridspec.GridSpec(4, 1, height_ratios=[3, 0.5, 1, 1])
+        # 3. Setup Layout - Ultra Wide for better candle spacing
+        fig = plt.figure(figsize=(20, 14), facecolor='white') 
+        gs = gridspec.GridSpec(4, 1, height_ratios=[3, 0.6, 1, 1])
         
-        # --- PANEL 1: PRICE (Index Based) ---
+        # --- PANEL 1: PRICE ---
         ax1 = plt.subplot(gs[0])
-        
-        # Use simple integer index for X axis
         x_vals = df_plot.index 
         
-        # Candles
+        # Candles - Adjusted Widths for "Clean" Look
         up = df_plot[df_plot.Close >= df_plot.Open]
         down = df_plot[df_plot.Close < df_plot.Open]
         
-        # Wider bars (width=0.8) because we have no gaps now
-        ax1.bar(up.index, up.Close - up.Open, width=0.8, bottom=up.Open, color='#089981', alpha=0.9) # TradingView Green
-        ax1.vlines(up.index, up.Low, up.High, color='#089981', linewidth=1)
+        # Body width 0.7 gives nice spacing. Wicks 0.6 keeps them crisp.
+        ax1.bar(up.index, up.Close - up.Open, width=0.7, bottom=up.Open, color='#089981', alpha=1.0, zorder=3) 
+        ax1.vlines(up.index, up.Low, up.High, color='#089981', linewidth=0.8, zorder=3)
         
-        ax1.bar(down.index, down.Close - down.Open, width=0.8, bottom=down.Open, color='#F23645', alpha=0.9) # TradingView Red
-        ax1.vlines(down.index, down.Low, down.High, color='#F23645', linewidth=1)
+        ax1.bar(down.index, down.Close - down.Open, width=0.7, bottom=down.Open, color='#F23645', alpha=1.0, zorder=3)
+        ax1.vlines(down.index, down.Low, down.High, color='#F23645', linewidth=0.8, zorder=3)
         
-        # Bollinger Bands
-        ax1.plot(x_vals, df_plot['BB_Upper'], color='#2962FF', linewidth=1, alpha=0.3)
-        ax1.plot(x_vals, df_plot['BB_Lower'], color='#2962FF', linewidth=1, alpha=0.3)
-        ax1.fill_between(x_vals, df_plot['BB_Upper'], df_plot['BB_Lower'], color='#2962FF', alpha=0.05)
+        # Overlays - Lighter & behind candles
+        ax1.plot(x_vals, df_plot['BB_Upper'], color='#2962FF', linewidth=0.8, alpha=0.4, zorder=2)
+        ax1.plot(x_vals, df_plot['BB_Lower'], color='#2962FF', linewidth=0.8, alpha=0.4, zorder=2)
+        ax1.fill_between(x_vals, df_plot['BB_Upper'], df_plot['BB_Lower'], color='#2962FF', alpha=0.03, zorder=1)
         
-        # EMAs
-        ax1.plot(x_vals, df_plot['EMA_5'], color='#2962FF', linewidth=1, alpha=0.8)   # Blue
-        ax1.plot(x_vals, df_plot['EMA_50'], color='#FF9800', linewidth=1, alpha=0.8)  # Orange
+        ax1.plot(x_vals, df_plot['EMA_5'], color='#2962FF', linewidth=1.2, alpha=0.9, label="EMA 5", zorder=2)
+        ax1.plot(x_vals, df_plot['EMA_50'], color='#FF9800', linewidth=1.2, alpha=0.9, label="EMA 50", zorder=2)
         
-        # Trendlines
         for line in trendlines:
-            ax1.plot(line['x'], line['y'], color='#9C27B0', linestyle='-', linewidth=2) # Purple Trendline
+            ax1.plot(line['x'], line['y'], color=line['color'], linestyle='-', linewidth=1.5, zorder=4)
 
-        ax1.set_title(f"{symbol} {color_arrow} ₹{last_price:.2f} ({pct_change:+.2f}%)", fontsize=16, fontweight='bold')
-        ax1.grid(True, color='#E0E0E0', linestyle='--', linewidth=0.5)
-        ax1.set_ylabel("Price")
+        # Title & Grid
+        ax1.set_title(f"{symbol} {color_arrow} ₹{last_price:.2f} ({pct_change:+.2f}%)", fontsize=18, fontweight='bold', pad=15)
+        ax1.grid(True, color='#f0f0f0', linestyle='-', linewidth=0.5, zorder=0) # Very faint grid
+        ax1.set_ylabel("Price", fontweight='bold')
+        ax1.legend(loc='upper left', frameon=False, fontsize=10)
 
         # --- PANEL 2: VOLUME ---
         ax2 = plt.subplot(gs[1], sharex=ax1)
         vol_colors = ['#089981' if c >= o else '#F23645' for c, o in zip(df_plot['Close'], df_plot['Open'])]
-        ax2.bar(x_vals, df_plot['Volume'], color=vol_colors, alpha=0.5, width=0.8)
-        ax2.grid(True, color='#E0E0E0', linestyle='--', linewidth=0.5)
-        ax2.set_ylabel("Vol")
+        ax2.bar(x_vals, df_plot['Volume'], color=vol_colors, alpha=0.6, width=0.7)
+        ax2.grid(True, color='#f0f0f0', linestyle='-', linewidth=0.5)
+        ax2.set_ylabel("Vol", fontweight='bold')
         
         # --- PANEL 3: RSI ---
         ax3 = plt.subplot(gs[2], sharex=ax1)
-        ax3.plot(x_vals, df_plot['RSI'], color='#7E57C2', linewidth=1.5) # Purple RSI
+        ax3.plot(x_vals, df_plot['RSI'], color='#7E57C2', linewidth=1.5)
         ax3.axhline(70, linestyle='--', color='#F23645', alpha=0.5)
         ax3.axhline(30, linestyle='--', color='#089981', alpha=0.5)
         ax3.fill_between(x_vals, df_plot['RSI'], 70, where=(df_plot['RSI']>=70), color='#F23645', alpha=0.1)
         ax3.fill_between(x_vals, df_plot['RSI'], 30, where=(df_plot['RSI']<=30), color='#089981', alpha=0.1)
-        ax3.set_ylabel("RSI")
-        ax3.grid(True, color='#E0E0E0', linestyle='--', linewidth=0.5)
+        ax3.set_ylabel("RSI", fontweight='bold')
+        ax3.grid(True, color='#f0f0f0', linestyle='-', linewidth=0.5)
         ax3.set_ylim(0, 100)
 
         # --- PANEL 4: MACD ---
         ax4 = plt.subplot(gs[3], sharex=ax1)
-        ax4.plot(x_vals, df_plot['MACD'], color='#2962FF', linewidth=1)
-        ax4.plot(x_vals, df_plot['Signal'], color='#FF9800', linewidth=1)
-        hist_colors = ['#089981' if v >= 0 else '#F23645' for v in df_plot['Hist']]
-        ax4.bar(x_vals, df_plot['Hist'], color=hist_colors, alpha=0.5, width=0.8)
-        ax4.set_ylabel("MACD")
-        ax4.grid(True, color='#E0E0E0', linestyle='--', linewidth=0.5)
+        ax4.plot(x_vals, df_plot['MACD'], color='#2962FF', linewidth=1.2, label="MACD")
+        ax4.plot(x_vals, df_plot['Signal'], color='#FF9800', linewidth=1.2, label="Signal")
+        hist_colors = ['#26a69a' if v >= 0 else '#ef5350' for v in df_plot['Hist']] # TradingView MACD colors
+        ax4.bar(x_vals, df_plot['Hist'], color=hist_colors, alpha=0.8, width=0.7)
+        ax4.set_ylabel("MACD", fontweight='bold')
+        ax4.grid(True, color='#f0f0f0', linestyle='-', linewidth=0.5)
+        ax4.legend(loc='upper left', frameon=False, fontsize=8)
 
         # --- FORMATTING DATE LABELS ---
-        # Since we used integers 0..N, we must map them back to dates for labels
-        date_labels = df_plot['Date'].dt.strftime('%b %d') # Format: "Jan 01"
-        
-        # Show roughly 10 labels across the chart
-        step = max(1, len(df_plot) // 10)
-        ax1.set_xticks(x_vals[::step])
-        ax1.set_xticklabels(date_labels[::step])
+        # Only show ~12 dates to avoid clutter
+        step = max(1, len(df_plot) // 12)
+        date_labels = df_plot['Date'].dt.strftime('%b %d')
+        ax4.set_xticks(x_vals[::step])
+        ax4.set_xticklabels(date_labels[::step], rotation=0, fontsize=10)
         
         # Hide x-labels for upper panels
         plt.setp(ax1.get_xticklabels(), visible=False)
         plt.setp(ax2.get_xticklabels(), visible=False)
         plt.setp(ax3.get_xticklabels(), visible=False)
         
-        # Final Layout Adjustment
-        plt.tight_layout()
-        plt.subplots_adjust(hspace=0.02) # Zero gap between plots
+        plt.subplots_adjust(left=0.05, right=0.95, top=0.95, bottom=0.05, hspace=0.04)
 
         # Save & Send
         buf = io.BytesIO()
-        plt.savefig(buf, format='png', bbox_inches='tight', dpi=120)
+        plt.savefig(buf, format='png', bbox_inches='tight', dpi=150) # Higher DPI for crisp text
         buf.seek(0)
         plt.close(fig)
 
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-        requests.post(url, files={'photo': buf}, data={'chat_id': CHAT_ID, 'caption': f"📊 {symbol} Smart Chart"})
-        logging.info(f"✅ Smart Chart sent for {symbol}")
+        requests.post(url, files={'photo': buf}, data={'chat_id': CHAT_ID, 'caption': f"📊 {symbol} Technicals ({CHART_PERIOD})"})
+        logging.info(f"✅ Chart sent for {symbol}")
 
     except Exception as e:
         logging.warning(f"❌ Failed to send chart for {symbol}: {e}", exc_info=True)
