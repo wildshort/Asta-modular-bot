@@ -3,7 +3,8 @@ import json
 import logging
 import pandas as pd
 import yfinance as yf
-from alerts.telegram import send_telegram
+# ✅ UPDATED IMPORT to include send_chart
+from alerts.telegram import send_telegram, send_chart 
 from utils.retry import retry_download
 from ta.trend import ADXIndicator
 
@@ -13,8 +14,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 
-# --- Helper Functions ---
-
+# --- Helper Functions (UNCHANGED) ---
 def compute_rsi(series: pd.Series, length: int = 14) -> pd.Series:
     delta = series.diff()
     gain = delta.clip(lower=0)
@@ -89,9 +89,6 @@ def compute_adx(high: pd.Series, low: pd.Series, close: pd.Series):
 def detect_rsi_divergence(price: pd.Series, rsi: pd.Series) -> str:
     return "None"
 
-
-# --- Result Formatting & Scanning Logic ---
-
 def format_result_block(results: list[dict], signal_type: str) -> str:
     lines = []
     for r in results:
@@ -103,7 +100,7 @@ def format_result_block(results: list[dict], signal_type: str) -> str:
             f"    🎯 BB Challenge      : {r['BB Challenge']}\n"
             f"    💡 MACD (Wave)       : {r['MACD Wave']} ({'>0' if r['MACD Wave > 0'] else '<0'})\n"
             f"    🌊 MACD (Tide)       : {r['MACD Tide']} ({'>0' if r['MACD Tide > 0'] else '<0'})\n"
-            f"    🔄 EMA 5/50 Xover   : {r['Crossover']}\n"
+            f"    🔄 EMA 5/50 Xover    : {r['Crossover']}\n"
             f"    📈 Trend Line        : {r['Trend']}\n"
             f"    💥 Volume Spike      : {'Yes' if r['Volume Spike'] else 'No'}\n"
             f"    😽 ADX Strength      : {r['ADX']:.2f}\n"
@@ -111,6 +108,8 @@ def format_result_block(results: list[dict], signal_type: str) -> str:
         )
     return f"\n\n{signal_type} Signals:\n" + "\n".join(lines)
 
+
+# --- MAIN LOGIC ---
 
 def run_stock_scan(symbols: list[str], send_alerts: bool = False):
     all_signals = []
@@ -168,7 +167,7 @@ def run_stock_scan(symbols: list[str], send_alerts: bool = False):
             })
 
         except Exception as e:
-            logging.error(f"{sym} → error: {e}", exc_info=True)
+            logging.error(f"{sym} -> error: {e}", exc_info=True)
             continue
 
     bullish, bearish = [], []
@@ -178,7 +177,7 @@ def run_stock_scan(symbols: list[str], send_alerts: bool = False):
         if r['ADX'] < 12:
             continue
 
-        # Bullish: weekly RSI > 50 AND daily RSI > 60
+        # Bullish Criteria
         if (r['RSI Tide'] > 50 and r['RSI Wave'] > 60
             and r['BB Challenge'] == "Upper BB Challenge"
             and r['Trend'] == "Bullish Trend BO"
@@ -186,9 +185,9 @@ def run_stock_scan(symbols: list[str], send_alerts: bool = False):
             and r['MACD Tide'] == "PCO"):
             r['Bias'] = 'PCO'
             bullish.append(r)
-            logging.info(f"🔔 Bullish → {r['Symbol']}")
+            logging.info(f"🔔 Bullish -> {r['Symbol']}")
 
-        # Bearish: weekly RSI < 50 AND daily RSI < 40
+        # Bearish Criteria
         elif (r['RSI Tide'] < 50 and r['RSI Wave'] < 40
               and r['BB Challenge'] == "Lower BB Challenge"
               and r['Trend'] == "Bearish Trend BD"
@@ -196,26 +195,33 @@ def run_stock_scan(symbols: list[str], send_alerts: bool = False):
               and r['MACD Tide'] == "NCO"):
             r['Bias'] = 'NCO'
             bearish.append(r)
-            logging.info(f"🔕 Bearish → {r['Symbol']}")
+            logging.info(f"🔕 Bearish -> {r['Symbol']}")
 
-    # Output results (console)
+    # --- OUTPUT RESULTS AND SEND CHARTS ---
+    
     if bullish:
         msg = format_result_block(bullish, "📈 Bullish")
         print(msg)
         if send_alerts:
             send_telegram(msg)
+            # 🆕 Send Charts for Bullish Stocks
+            logging.info("📤 Sending Bullish charts...")
+            for item in bullish:
+                send_chart(item['Symbol'])
 
     if bearish:
         msg = format_result_block(bearish, "📉 Bearish")
         print(msg)
         if send_alerts:
             send_telegram(msg)
+            # 🆕 Send Charts for Bearish Stocks
+            logging.info("📤 Sending Bearish charts...")
+            for item in bearish:
+                send_chart(item['Symbol'])
 
-    # --- Always write artifact-friendly outputs ---
+    # Artifacts (JSON output)
     try:
         os.makedirs("scanner/output", exist_ok=True)
-
-        # Compact machine-readable summary
         summary = {
             "bullish": [r["Symbol"] for r in bullish],
             "bearish": [r["Symbol"] for r in bearish],
@@ -224,20 +230,11 @@ def run_stock_scan(symbols: list[str], send_alerts: bool = False):
         with open("scanner/output/latest.json", "w") as f:
             json.dump(summary, f, indent=2)
 
-        # Optional: simple text list (handy to open in Actions UI)
-        with open("scanner/output/latest.txt", "w") as f:
-            f.write("Bullish:\n")
-            for s in summary["bullish"]:
-                f.write(f"- {s}\n")
-            f.write("\nBearish:\n")
-            for s in summary["bearish"]:
-                f.write(f"- {s}\n")
-
     except Exception as e:
         logging.error(f"Failed to write artifacts: {e}", exc_info=True)
 
 if __name__ == "__main__":
-    from watchlist.nifty_stocks import watchlist
+    # Local Test
+    from config import WATCHLIST
     logging.info("⏳ Market scanner starting now...")
-    run_stock_scan(watchlist, send_alerts=True)
-    logging.info("✅ One-time scan complete. Check logs and Telegram.")
+    run_stock_scan(WATCHLIST, send_alerts=True)
