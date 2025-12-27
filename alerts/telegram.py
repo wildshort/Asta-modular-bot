@@ -4,7 +4,6 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import matplotlib.dates as mdates
 import io
-import numpy as np
 import pandas as pd
 import yfinance as yf
 from config import TELEGRAM_TOKEN, CHAT_ID
@@ -32,12 +31,16 @@ def calculate_indicators(df):
     
     return df
 
-def get_trendline_points(df, window=20):
+def get_trendline_points(df):
     """
     Identifies simple support/resistance trendlines based on local highs/lows.
     Returns coordinates for drawing lines.
     """
+    # Create a copy to avoid SettingWithCopy warnings on the original df
+    df = df.copy()
+
     # 1. Identify Local Highs and Lows (Pivots)
+    # We use a window of 1 on each side (shift 1)
     df['pivot_high'] = df['High'][
         (df['High'].shift(1) < df['High']) & 
         (df['High'].shift(-1) < df['High'])
@@ -48,6 +51,7 @@ def get_trendline_points(df, window=20):
     ]
     
     # Get the last 3 significant pivots to draw recent trend
+    # We check if columns exist to be safe, though assignment above ensures they do
     highs = df.dropna(subset=['pivot_high']).tail(3)
     lows = df.dropna(subset=['pivot_low']).tail(3)
 
@@ -55,22 +59,30 @@ def get_trendline_points(df, window=20):
     
     # Resistance Line (Connect last two highs)
     if len(highs) >= 2:
-        x1, y1 = mdates.date2num(highs.index[-2]), highs['High'].iloc[-2]
-        x2, y2 = mdates.date2num(highs.index[-1]), highs['High'].iloc[-1]
+        x1 = mdates.date2num(highs.index[-2])
+        y1 = highs['High'].iloc[-2]
+        x2 = mdates.date2num(highs.index[-1])
+        y2 = highs['High'].iloc[-1]
+        
         # Extend line slightly to the right
-        slope = (y2 - y1) / (x2 - x1)
-        x_ext = mdates.date2num(df.index[-1])
-        y_ext = y1 + slope * (x_ext - x1)
-        lines.append({'x': [x1, x_ext], 'y': [y1, y_ext], 'color': 'red', 'label': 'Resist'})
+        if x2 != x1:
+            slope = (y2 - y1) / (x2 - x1)
+            x_ext = mdates.date2num(df.index[-1])
+            y_ext = y1 + slope * (x_ext - x1)
+            lines.append({'x': [x1, x_ext], 'y': [y1, y_ext], 'color': 'red', 'label': 'Resist'})
 
     # Support Line (Connect last two lows)
     if len(lows) >= 2:
-        x1, y1 = mdates.date2num(lows.index[-2]), lows['Low'].iloc[-2]
-        x2, y2 = mdates.date2num(lows.index[-1]), lows['Low'].iloc[-1]
-        slope = (y2 - y1) / (x2 - x1)
-        x_ext = mdates.date2num(df.index[-1])
-        y_ext = y1 + slope * (x_ext - x1)
-        lines.append({'x': [x1, x_ext], 'y': [y1, y_ext], 'color': 'green', 'label': 'Support'})
+        x1 = mdates.date2num(lows.index[-2])
+        y1 = lows['Low'].iloc[-2]
+        x2 = mdates.date2num(lows.index[-1])
+        y2 = lows['Low'].iloc[-1]
+        
+        if x2 != x1:
+            slope = (y2 - y1) / (x2 - x1)
+            x_ext = mdates.date2num(df.index[-1])
+            y_ext = y1 + slope * (x_ext - x1)
+            lines.append({'x': [x1, x_ext], 'y': [y1, y_ext], 'color': 'green', 'label': 'Support'})
         
     return lines
 
@@ -95,33 +107,40 @@ def send_chart(symbol: str):
         return
 
     try:
-        # 1. Fetch Data (1 Year as requested)
+        # 1. Fetch Data
         ticker = f"{symbol}" if ".NS" in symbol or "=" in symbol else f"{symbol}.NS"
         df = yf.download(ticker, period="1y", interval="1d", progress=False)
         
         if df.empty:
             logging.warning(f"⚠️ No chart data for {symbol}")
             return
-        
+
+        # 🔧 FIX: FLATTEN COLUMNS
+        # This fixes the KeyError by ensuring columns are simple strings ('Close') 
+        # instead of complex tuples (('Close', 'TATASTEEL.NS'))
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
         # 2. Prepare Data
         df = calculate_indicators(df)
         trendlines = get_trendline_points(df)
 
         # 3. Setup Plot Layout (3 Rows)
-        fig = plt.figure(figsize=(12, 12)) # Taller figure for 1 year data
+        fig = plt.figure(figsize=(12, 12)) 
         gs = gridspec.GridSpec(3, 1, height_ratios=[3, 1, 1])
         
         # --- PANEL 1: PRICE, CANDLES & TRENDLINES ---
         ax1 = plt.subplot(gs[0])
         
-        # Candlestick Logic (Thinner width=0.4 for 1 year data)
+        # Candlestick Logic
         up = df[df.Close >= df.Open]
         down = df[df.Close < df.Open]
         
-        ax1.bar(up.index, up.Close - up.Open, width=0.4, bottom=up.Open, color='green', alpha=0.7)
+        # Width 0.5 works well for 1 year data
+        ax1.bar(up.index, up.Close - up.Open, width=0.5, bottom=up.Open, color='green', alpha=0.7)
         ax1.vlines(up.index, up.Low, up.High, color='green', linewidth=0.8)
         
-        ax1.bar(down.index, down.Close - down.Open, width=0.4, bottom=down.Open, color='red', alpha=0.7)
+        ax1.bar(down.index, down.Close - down.Open, width=0.5, bottom=down.Open, color='red', alpha=0.7)
         ax1.vlines(down.index, down.Low, down.High, color='red', linewidth=0.8)
         
         # EMAs
@@ -154,7 +173,7 @@ def send_chart(symbol: str):
         ax3.plot(df.index, df['Signal'], label='Signal', color='orange', linewidth=1)
         
         colors = ['green' if v >= 0 else 'red' for v in df['Hist']]
-        ax3.bar(df.index, df['Hist'], color=colors, alpha=0.5, width=0.4)
+        ax3.bar(df.index, df['Hist'], color=colors, alpha=0.5, width=0.5)
         
         ax3.set_ylabel("MACD")
         ax3.grid(True, alpha=0.15)
@@ -168,7 +187,7 @@ def send_chart(symbol: str):
 
         # Save to Buffer
         buf = io.BytesIO()
-        plt.savefig(buf, format='png', bbox_inches='tight', dpi=100) # dpi=100 keeps file size manageable
+        plt.savefig(buf, format='png', bbox_inches='tight', dpi=100)
         buf.seek(0)
         plt.close(fig)
 
