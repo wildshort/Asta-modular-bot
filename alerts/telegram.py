@@ -10,19 +10,17 @@ from scipy.signal import argrelextrema
 from config import TELEGRAM_TOKEN, CHAT_ID
 
 # --- CONFIGURATION ---
-CHART_PERIOD = "2y"  # Need more history for valid Wave Counts
+CHART_PERIOD = "2y"  # Need history for both trendlines and waves
 
-# --- HELPER: MATH & INDICATORS ---
+# --- HELPER: INDICATORS ---
 def calculate_indicators(df):
-    """Calculates EMAs, RSI, MACD, and Bollinger Bands."""
-    df['EMA_5'] = df['Close'].ewm(span=5, adjust=False).mean()
+    """Calculates EMAs, RSI, MACD, BB."""
     df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
     
-    # Bollinger Bands
+    # BB
     df['BB_Mid'] = df['Close'].rolling(window=20).mean()
-    df['BB_Std'] = df['Close'].rolling(window=20).std()
-    df['BB_Upper'] = df['BB_Mid'] + (2 * df['BB_Std'])
-    df['BB_Lower'] = df['BB_Mid'] - (2 * df['BB_Std'])
+    df['BB_Upper'] = df['BB_Mid'] + (2 * df['Close'].rolling(window=20).std())
+    df['BB_Lower'] = df['BB_Mid'] - (2 * df['Close'].rolling(window=20).std())
     
     # RSI
     delta = df['Close'].diff()
@@ -40,77 +38,83 @@ def calculate_indicators(df):
     
     return df
 
-def get_pivots(df):
-    """Finds significant Price Pivots (Highs/Lows)."""
-    # Order=10 to find major structural points, not just noise
+# --- HELPER: GEOMETRY & STRUCTURE ---
+def get_technical_structure(df):
+    """ Finds Pivots, Trendlines, and Horizontal Levels based on integer index. """
+    df = df.copy()
+    df['idx'] = range(len(df)) # Integer index for geometry
+    last_idx = df['idx'].iloc[-1]
+
+    # 1. Find Pivots (Order=10 for major swings)
     df['pivot_high'] = df.iloc[argrelextrema(df['High'].values, np.greater, order=10)[0]]['High']
     df['pivot_low'] = df.iloc[argrelextrema(df['Low'].values, np.less, order=10)[0]]['Low']
     
     pivots = []
+    pivot_highs_df = []
+    pivot_lows_df = []
+
     for idx, row in df.iterrows():
+        i = row['idx']
         if not np.isnan(row['pivot_high']):
-            pivots.append({'idx': idx, 'price': row['pivot_high'], 'type': 'high'})
+            p = {'i': i, 'price': row['pivot_high'], 'type': 'high'}
+            pivots.append(p)
+            pivot_highs_df.append(p)
         if not np.isnan(row['pivot_low']):
-            pivots.append({'idx': idx, 'price': row['pivot_low'], 'type': 'low'})
-    return pivots
+            p = {'i': i, 'price': row['pivot_low'], 'type': 'low'}
+            pivots.append(p)
+            pivot_lows_df.append(p)
 
-def analyze_wave_setup(pivots, current_price):
-    """
-    Analyzes the last 4-5 pivots to detect Wave 3 or Wave 5 setups at breakout.
-    Returns: (Wave_Status, Target_Price, Stop_Loss)
-    """
-    if len(pivots) < 5:
-        return "Unclear Structure", 0, 0
+    # 2. Trendlines (Connecting last 2 major peaks/valleys)
+    lines = []
+    if len(pivot_highs_df) >= 2:
+        p1, p2 = pivot_highs_df[-2], pivot_highs_df[-1]
+        slope = (p2['price'] - p1['price']) / (p2['i'] - p1['i'])
+        y_end = p2['price'] + slope * (last_idx - p2['i'])
+        lines.append({'x': [p1['i'], last_idx], 'y': [p1['price'], y_end], 'color': 'red', 'label': 'Resist Line'})
 
-    # Get last 4 pivots (most recent at end of list)
-    p4 = pivots[-1] # Most recent pivot (Should be a Low if we are breaking out Up)
-    p3 = pivots[-2] # High
-    p2 = pivots[-3] # Low
-    p1 = pivots[-4] # High
+    if len(pivot_lows_df) >= 2:
+        p1, p2 = pivot_lows_df[-2], pivot_lows_df[-1]
+        slope = (p2['price'] - p1['price']) / (p2['i'] - p1['i'])
+        y_end = p2['price'] + slope * (last_idx - p2['i'])
+        lines.append({'x': [p1['i'], last_idx], 'y': [p1['price'], y_end], 'color': 'green', 'label': 'Support Line'})
+
+    # 3. Horizontal Levels (6-month High/Low)
+    recent_df = df.tail(126) # Approx 6 months
+    lines.append({'x': [df['idx'].iloc[0], last_idx], 'y': [recent_df['High'].max(), recent_df['High'].max()], 'color': 'red', 'style': ':', 'label': 'Major Res'})
+    lines.append({'x': [df['idx'].iloc[0], last_idx], 'y': [recent_df['Low'].min(), recent_df['Low'].min()], 'color': 'green', 'style': ':', 'label': 'Major Sup'})
+
+    return pivots, lines
+
+# --- HELPER: ELLIOTT WAVE LOGIC ---
+def analyze_wave_setup(pivots):
+    """ Checks last 4-5 pivots for Wave 3 or 5 setup at current price. """
+    if len(pivots) < 5: return "Watching...", 0, 0
+
+    # Most recent pivots
+    p4 = pivots[-1]; p3 = pivots[-2]; p2 = pivots[-3]; p1 = pivots[-4]
     
-    # --- CHECK FOR WAVE 3 START ---
-    # Setup: We finished Wave 2 (p4) and are breaking out above Wave 1 (p3)
-    # Pattern: Low(Start) -> High(W1) -> Higher Low(W2) -> BREAKOUT
+    # Wave 3 Setup: Finished W2 low (p4), breaking out above W1 high (p3)
     if p4['type'] == 'low' and p3['type'] == 'high' and p2['type'] == 'low':
-        
-        # Rule 1: Wave 2 must NOT retrace 100% of Wave 1
-        if p4['price'] > p2['price']: 
-            # We have a Higher Low (Valid Wave 2)
-            
-            # Fibonacci Target for Wave 3 (1.618 extension of Wave 1)
+        # Rule: W2 (p4) must be higher than Start (p2)
+        if p4['price'] > p2['price']:
             wave1_height = p3['price'] - p2['price']
-            target = p4['price'] + (wave1_height * 1.618)
-            stop_loss = p4['price'] # Stop below Wave 2 low
-            
-            return "🌊 Possible WAVE 3 Start", target, stop_loss
+            target = p4['price'] + (wave1_height * 1.618) # 1.618 ext
+            stop = p4['price'] # Below W2
+            return "🌊 Possible WAVE 3 Start", target, stop
 
-    # --- CHECK FOR WAVE 5 START ---
-    # Setup: We finished Wave 4 (p4) and are breaking out above Wave 3 (p3)
-    # Pattern: W1_High -> W2_Low -> W3_High -> W4_Low -> BREAKOUT
+    # Wave 5 Setup: Finished W4 low (p5), breaking out above W3 high (p4)
     if len(pivots) >= 6:
-        p5_recent = pivots[-1] # Low (Wave 4)
-        p4_high = pivots[-2]   # High (Wave 3)
-        p3_low = pivots[-3]    # Low (Wave 2)
-        p2_high = pivots[-4]   # High (Wave 1)
-        p1_low = pivots[-5]    # Start
+        p5 = pivots[-1]; p4_h = pivots[-2]; p3_l = pivots[-3]; p2_h = pivots[-4]; p1_l = pivots[-5]
+        if p5['type'] == 'low' and p4_h['type'] == 'high':
+            # Rule: W4 (p5) no overlap W1 (p2_h) AND W3 not shortest
+            w1_len = p2_h['price'] - p1_l['price']
+            w3_len = p4_h['price'] - p3_l['price']
+            if p5['price'] > p2_h['price'] and w3_len > w1_len:
+                target = p5['price'] + w1_len # W5 = W1 often
+                stop = p5['price']
+                return "🌊 Possible WAVE 5 Start", target, stop
 
-        if p5_recent['type'] == 'low' and p4_high['type'] == 'high':
-            
-            # Rule 1: Wave 4 must NOT overlap Wave 1
-            if p5_recent['price'] > p2_high['price']:
-                
-                # Rule 2: Wave 3 is not the shortest
-                w1_len = p2_high['price'] - p1_low['price']
-                w3_len = p4_high['price'] - p3_low['price']
-                
-                if w3_len > w1_len: # Rough check, confirming W3 strength
-                    # Target for Wave 5 (Usually equal to Wave 1 or 0.618 of W1+W3)
-                    target = p5_recent['price'] + w1_len 
-                    stop_loss = p5_recent['price']
-                    
-                    return "🌊 Possible WAVE 5 Start", target, stop_loss
-
-    return "Correction / Noise", 0, 0
+    return "Ranging / Correction", 0, 0
 
 # --- MAIN FUNCTIONS ---
 def send_telegram(message: str):
@@ -130,79 +134,78 @@ def send_chart(symbol: str):
         if df.empty: return
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
 
-        # Process Data
+        # Process
         df = calculate_indicators(df)
         df_plot = df.reset_index()
-        pivots = get_pivots(df)
+        pivots, structure_lines = get_technical_structure(df)
+        wave_msg, target, stop = analyze_wave_setup(pivots)
         
-        # --- ELLIOTT WAVE ANALYSIS ---
-        current_price = df['Close'].iloc[-1]
-        wave_msg, target, stop = analyze_wave_setup(pivots, current_price)
-
         # Setup Plot
-        fig = plt.figure(figsize=(20, 14), facecolor='white') 
-        gs = gridspec.GridSpec(2, 1, height_ratios=[3, 1])
+        fig = plt.figure(figsize=(20, 16), facecolor='white') 
+        gs = gridspec.GridSpec(4, 1, height_ratios=[3, 0.6, 1, 1])
         
-        # PANEL 1: PRICE & WAVES
+        # --- PANEL 1: PRICE & STRUCTURE ---
         ax1 = plt.subplot(gs[0])
         x_vals = df_plot.index 
         
         # Candles
-        up = df_plot[df_plot.Close >= df_plot.Open]
-        down = df_plot[df_plot.Close < df_plot.Open]
-        ax1.bar(up.index, up.Close - up.Open, width=0.7, bottom=up.Open, color='#089981', alpha=1.0) 
+        up = df_plot[df_plot.Close >= df_plot.Open]; down = df_plot[df_plot.Close < df_plot.Open]
+        ax1.bar(up.index, up.Close - up.Open, width=0.7, bottom=up.Open, color='#089981', alpha=1) 
         ax1.vlines(up.index, up.Low, up.High, color='#089981', linewidth=0.8)
-        ax1.bar(down.index, down.Close - down.Open, width=0.7, bottom=down.Open, color='#F23645', alpha=1.0)
+        ax1.bar(down.index, down.Close - down.Open, width=0.7, bottom=down.Open, color='#F23645', alpha=1)
         ax1.vlines(down.index, down.Low, down.High, color='#F23645', linewidth=0.8)
         
-        # Plot Pivots / Wave Points
-        for p in pivots:
-            # Match date to index
-            match = df_plot[df_plot['Date'] == p['idx']]
-            if not match.empty:
-                x = match.index[0]
-                color = 'green' if p['type'] == 'low' else 'red'
-                ax1.plot(x, p['price'], marker='o', markersize=5, color=color)
+        # Overlays (BB, EMA)
+        ax1.fill_between(x_vals, df_plot['BB_Upper'], df_plot['BB_Lower'], color='gray', alpha=0.1)
+        ax1.plot(x_vals, df_plot['EMA_50'], color='#FF9800', linewidth=1.5, label="EMA 50")
 
-        # Draw Target Line if Valid Wave
-        if target > 0:
-            ax1.axhline(target, color='purple', linestyle='--', linewidth=2, label=f'Target: {target:.2f}')
-            ax1.axhline(stop, color='red', linestyle=':', linewidth=2, label=f'Invalidation: {stop:.2f}')
+        # Draw Structure (Trendlines & Horizontal)
+        for line in structure_lines:
+            style = line.get('style', '-')
+            ax1.plot(line['x'], line['y'], color=line['color'], linestyle=style, linewidth=1.5, label=line['label'])
             
-        # Title
-        last_price = df['Close'].iloc[-1]
-        pct_change = ((last_price - df['Close'].iloc[-2]) / df['Close'].iloc[-2]) * 100
-        title_text = f"{symbol}: {wave_msg} | Price: {last_price:.2f}"
-        ax1.set_title(title_text, fontsize=18, fontweight='bold', pad=15)
-        ax1.grid(True, color='#f0f0f0')
-        ax1.legend(loc='upper left')
+        # Draw Pivots (Small dots for context)
+        for p in pivots:
+            color = 'green' if p['type'] == 'low' else 'red'
+            ax1.plot(p['i'], p['price'], marker='o', markersize=4, color=color, alpha=0.6)
 
-        # PANEL 2: MACD (Momentum Confirmation)
+        # Draw Wave Target/Stop (if valid setup)
+        if target > 0:
+            ax1.axhline(target, color='#9C27B0', linestyle='--', linewidth=2, label=f'🎯 Target: {target:.2f}')
+            ax1.axhline(stop, color='#F23645', linestyle=':', linewidth=2, label=f'🛑 Stop: {stop:.2f}')
+
+        # Title & Grid
+        last_price = df['Close'].iloc[-1]
+        pct = ((last_price - df['Close'].iloc[-2]) / df['Close'].iloc[-2]) * 100
+        title = f"{symbol} {'🟢' if pct>=0 else '🔴'} ₹{last_price:.2f} ({pct:+.2f}%) | {wave_msg}"
+        ax1.set_title(title, fontsize=16, fontweight='bold', pad=15)
+        ax1.grid(True, color='#f0f0f0'); ax1.legend(loc='upper left', frameon=False, fontsize=9)
+
+        # --- PANEL 2, 3, 4 (Vol, RSI, MACD) ---
         ax2 = plt.subplot(gs[1], sharex=ax1)
-        ax2.plot(x_vals, df_plot['MACD'], color='#2962FF', label='MACD')
-        ax2.plot(x_vals, df_plot['Signal'], color='#FF9800', label='Signal')
-        ax2.bar(x_vals, df_plot['Hist'], color=['#26a69a' if v >= 0 else '#ef5350' for v in df_plot['Hist']])
-        ax2.set_ylabel("MACD", fontweight='bold')
-        ax2.legend()
+        vol_colors = ['#089981' if c >= o else '#F23645' for c, o in zip(df_plot['Close'], df_plot['Open'])]
+        ax2.bar(x_vals, df_plot['Volume'], color=vol_colors, alpha=0.6); ax2.set_ylabel("Vol", fontweight='bold'); ax2.grid(True, color='#f0f0f0')
+
+        ax3 = plt.subplot(gs[2], sharex=ax1)
+        ax3.plot(x_vals, df_plot['RSI'], color='#7E57C2'); ax3.axhline(70, color='red', ls='--'); ax3.axhline(30, color='green', ls='--')
+        ax3.set_ylabel("RSI", fontweight='bold'); ax3.grid(True, color='#f0f0f0'); ax3.set_ylim(0, 100)
+
+        ax4 = plt.subplot(gs[3], sharex=ax1)
+        ax4.plot(x_vals, df_plot['MACD'], color='#2962FF'); ax4.plot(x_vals, df_plot['Signal'], color='#FF9800')
+        ax4.bar(x_vals, df_plot['Hist'], color=['#26a69a' if v >= 0 else '#ef5350' for v in df_plot['Hist']], alpha=0.8)
+        ax4.set_ylabel("MACD", fontweight='bold'); ax4.grid(True, color='#f0f0f0')
 
         # Formatting
         step = max(1, len(df_plot) // 12)
-        date_labels = df_plot['Date'].dt.strftime('%b %d')
-        ax2.set_xticks(x_vals[::step])
-        ax2.set_xticklabels(date_labels[::step], rotation=0)
-        plt.setp(ax1.get_xticklabels(), visible=False)
+        ax4.set_xticks(x_vals[::step]); ax4.set_xticklabels(df_plot['Date'].dt.strftime('%b %d')[::step], rotation=0)
+        plt.setp([ax.get_xticklabels() for ax in [ax1, ax2, ax3]], visible=False)
         plt.subplots_adjust(left=0.05, right=0.95, top=0.95, bottom=0.05, hspace=0.04)
 
         # Send
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png', bbox_inches='tight', dpi=150)
-        buf.seek(0)
-        plt.close(fig)
-
-        caption = f"📊 {symbol} Analysis\nStatus: {wave_msg}\n🎯 Target: {target:.2f}\n🛑 Stop: {stop:.2f}"
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-        requests.post(url, files={'photo': buf}, data={'chat_id': CHAT_ID, 'caption': caption})
-        logging.info(f"✅ Wave Chart sent for {symbol}")
+        buf = io.BytesIO(); plt.savefig(buf, format='png', bbox_inches='tight', dpi=150); buf.seek(0); plt.close(fig)
+        caption = f"📊 {symbol} Analysis\nStatus: {wave_msg}\nTarget: {target:.2f} | Stop: {stop:.2f}"
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto", files={'photo': buf}, data={'chat_id': CHAT_ID, 'caption': caption})
+        logging.info(f"✅ Full Analysis Chart sent for {symbol}")
 
     except Exception as e:
         logging.warning(f"❌ Failed to send chart for {symbol}: {e}", exc_info=True)
