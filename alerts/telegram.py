@@ -10,7 +10,7 @@ from scipy.signal import argrelextrema
 from config import TELEGRAM_TOKEN, CHAT_ID
 
 # --- CONFIGURATION ---
-CHART_PERIOD = "1y" # 1 Year gives the best trendline context
+CHART_PERIOD = "1y" 
 
 # --- HELPER: INDICATORS ---
 def calculate_indicators(df):
@@ -32,17 +32,69 @@ def calculate_indicators(df):
     
     return df
 
+# --- HELPER: CANDLESTICK PATTERNS (THE SNIPER) ---
+def analyze_breakout_candle(df, direction):
+    """
+    Analyzes the last candle to confirm strength or detect weakness.
+    direction: 'bullish' (Breakout) or 'bearish' (Breakdown)
+    """
+    curr = df.iloc[-1]
+    prev = df.iloc[-2]
+    
+    body = abs(curr['Close'] - curr['Open'])
+    total_range = curr['High'] - curr['Low']
+    upper_wick = curr['High'] - max(curr['Close'], curr['Open'])
+    lower_wick = min(curr['Close'], curr['Open']) - curr['Low']
+    
+    # Avoid div by zero
+    if total_range == 0: return "Unknown"
+    
+    body_pct = body / total_range
+    
+    if direction == 'bullish':
+        # 1. TRAP CHECK: Long Upper Wick (Rejection)
+        # If the upper wick is bigger than the body, buyers failed to hold.
+        if upper_wick > body:
+            return "⚠️ FAKEOUT (Wick Rejection)"
+            
+        # 2. STRENGTH CHECK: Marubozu (Big Body, Small Wicks)
+        # Body is > 60% of range and closing near high
+        if body_pct > 0.6 and upper_wick < (0.2 * body):
+            return "🔥 STRONG MARUBOZU"
+            
+        # 3. MOMENTUM CHECK: Engulfing
+        # Green candle completely eats previous Red candle
+        if curr['Close'] > prev['Open'] and curr['Open'] < prev['Close'] and curr['Close'] > curr['Open']:
+            return "🔄 ENGULFING CONFIRMATION"
+            
+        return "✅ Valid Breakout"
+
+    elif direction == 'bearish':
+        # 1. TRAP CHECK: Long Lower Wick (Support held)
+        if lower_wick > body:
+            return "⚠️ FAKEOUT (Support Held)"
+            
+        # 2. STRENGTH CHECK: Marubozu
+        if body_pct > 0.6 and lower_wick < (0.2 * body):
+            return "🔥 STRONG DROP (Marubozu)"
+            
+        # 3. MOMENTUM CHECK: Engulfing
+        if curr['Close'] < prev['Open'] and curr['Open'] > prev['Close'] and curr['Close'] < curr['Open']:
+            return "🔄 ENGULFING BREAKDOWN"
+            
+        return "✅ Valid Breakdown"
+        
+    return "Watching"
+
 # --- HELPER: SMART TRENDLINES ---
 def get_breakout_status(df):
     """
-    Identifies valid Trendlines and checks for Breakouts.
-    Returns: status_msg, valid_lines
+    Identifies Trendlines and checks for High-Quality Breakouts.
     """
     df = df.copy()
     df['idx'] = range(len(df))
     
-    # Find Pivots (Peaks and Valleys)
-    # Order=5 captures local swings suitable for trendlines
+    # Find Pivots (Order=10 for major swings)
     df['pivot_high'] = df.iloc[argrelextrema(df['High'].values, np.greater, order=10)[0]]['High']
     df['pivot_low'] = df.iloc[argrelextrema(df['Low'].values, np.less, order=10)[0]]['Low']
     
@@ -54,69 +106,39 @@ def get_breakout_status(df):
     current_close = df['Close'].iloc[-1]
     last_idx = df['idx'].iloc[-1]
 
-    # --- 1. CHECK RESISTANCE TRENDLINE (Down-sloping) ---
-    # Logic: Connect Global High -> Most Recent Significant Lower High
+    # 1. RESISTANCE (Bullish Breakout Check)
     if len(highs) >= 2:
-        # Sort by price descending to find the 'Major' High
         major_high = highs.sort_values('pivot_high', ascending=False).iloc[0]
-        
-        # Find a subsequent peak that is LOWER than major high (to form downtrend)
-        # We look at peaks occuring AFTER the major high
         subsequent_peaks = highs[highs['idx'] > major_high['idx']]
         
         if not subsequent_peaks.empty:
-            # Connect to the most recent significant peak
             recent_peak = subsequent_peaks.iloc[-1]
-            
-            # Calculate Slope
             slope = (recent_peak['pivot_high'] - major_high['pivot_high']) / (recent_peak['idx'] - major_high['idx'])
-            
-            # Extend line to current candle
             line_val_at_current = recent_peak['pivot_high'] + slope * (last_idx - recent_peak['idx'])
             
-            # Add to plot list
-            lines.append({
-                'x': [major_high['idx'], last_idx], 
-                'y': [major_high['pivot_high'], line_val_at_current], 
-                'color': 'red', 
-                'label': 'Resist'
-            })
+            lines.append({'x': [major_high['idx'], last_idx], 'y': [major_high['pivot_high'], line_val_at_current], 'color': 'red', 'label': 'Resist'})
             
-            # CHECK BREAKOUT: If Price > Line (and Line is down-sloping)
+            # CHECK BREAKOUT
             if current_close > line_val_at_current and slope < 0:
-                status = "🚀 TRENDLINE BREAKOUT"
+                confirmation = analyze_breakout_candle(df, 'bullish')
+                status = f"🚀 {confirmation}"
 
-    # --- 2. CHECK SUPPORT TRENDLINE (Up-sloping) ---
-    # Logic: Connect Global Low -> Most Recent Significant Higher Low
+    # 2. SUPPORT (Bearish Breakdown Check)
     if len(lows) >= 2:
-        # Sort by price ascending to find 'Major' Low
         major_low = lows.sort_values('pivot_low', ascending=True).iloc[0]
-        
-        # Find subsequent trough occurring AFTER major low
         subsequent_lows = lows[lows['idx'] > major_low['idx']]
         
         if not subsequent_lows.empty:
             recent_low = subsequent_lows.iloc[-1]
-            
-            # Calculate Slope
             slope = (recent_low['pivot_low'] - major_low['pivot_low']) / (recent_low['idx'] - major_low['idx'])
-            
-            # Extend line
             line_val_at_current = recent_low['pivot_low'] + slope * (last_idx - recent_low['idx'])
             
-            # Add to plot list
-            lines.append({
-                'x': [major_low['idx'], last_idx], 
-                'y': [major_low['pivot_low'], line_val_at_current], 
-                'color': 'green', 
-                'label': 'Support'
-            })
+            lines.append({'x': [major_low['idx'], last_idx], 'y': [major_low['pivot_low'], line_val_at_current], 'color': 'green', 'label': 'Support'})
             
-            # CHECK BREAKDOWN: If Price < Line (and Line is up-sloping)
+            # CHECK BREAKDOWN
             if current_close < line_val_at_current and slope > 0:
-                # If we already have a breakout, this might be a conflicting signal, 
-                # but Breakdown usually takes precedence in panic.
-                status = "⚠️ TRENDLINE BREAKDOWN"
+                confirmation = analyze_breakout_candle(df, 'bearish')
+                status = f"🔻 {confirmation}"
 
     return status, lines
 
@@ -141,11 +163,12 @@ def send_chart(symbol: str):
         # Process
         df = calculate_indicators(df)
         status, lines = get_breakout_status(df)
-
-        # 🚨 FILTER: ONLY SEND IF BREAKOUT/BREAKDOWN 🚨
-        # Uncomment the next 2 lines if you want to strictly silence "Watching"
-        # if "Watching" in status: 
-        #    return 
+        
+        # --- SNIPER FILTER ---
+        # Only send if we have a Breakout/Breakdown (Status is not just 'Watching')
+        # AND it's not a 'Fakeout' (optional strictness)
+        if status == "Watching": 
+            return 
 
         df_plot = df.reset_index()
         
@@ -153,7 +176,7 @@ def send_chart(symbol: str):
         fig = plt.figure(figsize=(20, 12), facecolor='white') 
         gs = gridspec.GridSpec(3, 1, height_ratios=[3, 1, 1])
         
-        # --- PANEL 1: PRICE & TRENDLINES ---
+        # PANEL 1: PRICE
         ax1 = plt.subplot(gs[0])
         x_vals = df_plot.index 
         
@@ -166,19 +189,20 @@ def send_chart(symbol: str):
         
         # Overlays
         ax1.plot(x_vals, df_plot['EMA_50'], color='#FF9800', linewidth=1.5, label="EMA 50")
-
-        # Draw Valid Trendlines
         for line in lines:
             ax1.plot(line['x'], line['y'], color=line['color'], linestyle='-', linewidth=2, label=line['label'])
 
         # Title
         last_price = df['Close'].iloc[-1]
         pct = ((last_price - df['Close'].iloc[-2]) / df['Close'].iloc[-2]) * 100
+        # Dynamic Color based on Sniper Status
+        title_color = 'green' if 'ROCKET' in status or 'STRONG' in status else 'black'
+        
         title = f"{symbol} {'🟢' if pct>=0 else '🔴'} ₹{last_price:.2f} ({pct:+.2f}%) | {status}"
-        ax1.set_title(title, fontsize=16, fontweight='bold', pad=15)
+        ax1.set_title(title, fontsize=16, fontweight='bold', pad=15, color=title_color)
         ax1.grid(True, color='#f0f0f0'); ax1.legend(loc='upper left', frameon=False)
 
-        # --- PANELS 2, 3 (RSI, MACD) ---
+        # PANELS 2, 3
         ax2 = plt.subplot(gs[1], sharex=ax1)
         ax2.plot(x_vals, df_plot['RSI'], color='#7E57C2'); ax2.axhline(70, color='red', ls='--'); ax2.axhline(30, color='green', ls='--')
         ax2.set_ylabel("RSI", fontweight='bold'); ax2.grid(True, color='#f0f0f0'); ax2.set_ylim(0, 100)
@@ -197,7 +221,6 @@ def send_chart(symbol: str):
         # Send
         buf = io.BytesIO(); plt.savefig(buf, format='png', bbox_inches='tight', dpi=150); buf.seek(0); plt.close(fig)
         
-        # Only alert caption if something interesting is happening
         caption = f"📊 {symbol} Analysis: {status}"
         requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto", files={'photo': buf}, data={'chat_id': CHAT_ID, 'caption': caption})
         logging.info(f"✅ Chart sent for {symbol}")
