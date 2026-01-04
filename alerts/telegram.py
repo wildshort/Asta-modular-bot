@@ -23,8 +23,7 @@ def calculate_indicators(df):
     df['BB_Upper'] = df['BB_Mid'] + (2 * df['BB_Std'])
     df['BB_Lower'] = df['BB_Mid'] - (2 * df['BB_Std'])
     
-    # Band Width & Slope (for BKP/Base detection)
-    df['BB_Width'] = (df['BB_Upper'] - df['BB_Lower']) / df['BB_Mid']
+    # Band Slope (for BKP check)
     df['BB_Lower_Slope'] = df['BB_Lower'].diff()
     df['BB_Upper_Slope'] = df['BB_Upper'].diff()
     
@@ -51,7 +50,6 @@ def check_asta_setup(df):
     2. Wave (Daily) Patterns (DB/FBD, BKP, TI Uptick, SO BBO)
     """
     # --- 1. PREPARE WEEKLY DATA (TIDE) ---
-    # Resample daily to weekly to avoid extra API calls
     df_week = df.resample('W').agg({'Close': 'last'})
     df_week['BB_Mid'] = df_week['Close'].rolling(window=20).mean()
     df_week['BB_Std'] = df_week['Close'].rolling(window=20).std()
@@ -59,14 +57,11 @@ def check_asta_setup(df):
     df_week['BB_Lower'] = df_week['BB_Mid'] - (2 * df_week['BB_Std'])
     
     # Tide Conditions
-    # Buy: BBNC on Downside (Lower band not sloping down sharply)
     tide_buy_ok = False
     if len(df_week) > 2:
-        # Check slope of weekly lower band. > -0.01 means flat or up (Not Challenged)
         lower_band_slope = df_week['BB_Lower'].diff().iloc[-1]
-        tide_buy_ok = lower_band_slope > -5.0 # Loose filter: Just ensure it's not crashing vertically
+        tide_buy_ok = lower_band_slope > -5.0 
     
-    # Sell: BBNC on Upside (Upper band not sloping up sharply)
     tide_sell_ok = False
     if len(df_week) > 2:
         upper_band_slope = df_week['BB_Upper'].diff().iloc[-1]
@@ -76,7 +71,6 @@ def check_asta_setup(df):
     df = calculate_indicators(df)
     df['idx'] = range(len(df))
     
-    # Find Pivots for Patterns
     df['pivot_low'] = df.iloc[argrelextrema(df['Low'].values, np.less, order=5)[0]]['Low']
     df['pivot_high'] = df.iloc[argrelextrema(df['High'].values, np.greater, order=5)[0]]['High']
     
@@ -91,29 +85,22 @@ def check_asta_setup(df):
     if len(lows) >= 2:
         b1 = lows.iloc[-2]; b2 = lows.iloc[-1]
         
-        # Pattern: Double Bottom / Shake Out (SO)
-        # Check if B2 is near B1 or slightly below (Shake Out)
-        # Logic: Price dipped below B1 but recovered?
+        # Shake Out / Double Bottom logic
         dist_pct = abs(b1['pivot_low'] - b2['pivot_low']) / b1['pivot_low']
         is_shakeout = df['Low'].iloc[-5:].min() < b1['pivot_low'] and curr['Close'] > b1['pivot_low']
         
         if (dist_pct < 0.03 or is_shakeout) and tide_buy_ok:
-            # CHECK ASTA MANDATORY CONDITIONS
-            
-            # 1. Candle: Bullish Engulfing or Strong Green
+            # 1. Bullish Engulfing
             is_engulfing = curr['Close'] > prev['Open'] and curr['Open'] < prev['Close'] and curr['Close'] > curr['Open']
-            
-            # 2. BKP (Base/Cup at Lower BB): Band Slope is flat/up
+            # 2. BKP (Base Formed)
             is_bkp = curr['BB_Lower_Slope'] > -1.0 
-            
-            # 3. TI Uptick (MACD Hist Increasing)
+            # 3. TI Uptick
             is_ti_uptick = curr['Hist'] > prev['Hist']
-            
             # 4. RSI > 40
             is_rsi_ok = curr['RSI'] > 40
             
             if is_engulfing and is_ti_uptick and is_rsi_ok:
-                signal = "🚀 ASTA BUY"
+                signal = "🚀 BUY"  # Cleaned name
                 if is_shakeout: reasons.append("SO BBO (Shake Out)")
                 if is_bkp: reasons.append("BKP (Base Formed)")
                 reasons.append("TI Uptick")
@@ -123,32 +110,28 @@ def check_asta_setup(df):
     if len(highs) >= 2:
         t1 = highs.iloc[-2]; t2 = highs.iloc[-1]
         
-        # Pattern: Double Top / FBO
         is_fbo = df['High'].iloc[-5:].max() > t1['pivot_high'] and curr['Close'] < t1['pivot_high']
         dist_pct = abs(t1['pivot_high'] - t2['pivot_high']) / t1['pivot_high']
         
         if (dist_pct < 0.03 or is_fbo) and tide_sell_ok:
-            # 1. Candle: Bearish Engulfing
+            # 1. Bearish Engulfing
             is_engulfing = curr['Close'] < prev['Open'] and curr['Open'] > prev['Close'] and curr['Close'] < curr['Open']
-            
-            # 2. BKT (Top at Upper BB): Band Slope flat/down
+            # 2. BKT
             is_bkt = curr['BB_Upper_Slope'] < 1.0
-            
             # 3. TI Downtick
             is_ti_downtick = curr['Hist'] < prev['Hist']
-            
             # 4. RSI < 60
             is_rsi_ok = curr['RSI'] < 60
             
             if is_engulfing and is_ti_downtick and is_rsi_ok:
-                signal = "🔻 ASTA SELL"
+                signal = "🔻 SELL" # Cleaned name
                 if is_fbo: reasons.append("FBO (Trap)")
                 reasons.append("TI Downtick")
 
     return signal, ", ".join(reasons)
 
 def get_breakout_status(df):
-    """ Standard Trendline Logic (Kept as backup) """
+    """ Standard Trendline Logic """
     df = df.copy(); df['idx'] = range(len(df))
     df['pivot_high'] = df.iloc[argrelextrema(df['High'].values, np.greater, order=10)[0]]['High']
     df['pivot_low'] = df.iloc[argrelextrema(df['Low'].values, np.less, order=10)[0]]['Low']
@@ -204,13 +187,17 @@ def send_chart(symbol: str):
         tl_status, lines = get_breakout_status(df)
         asta_signal, asta_reasons = check_asta_setup(df)
         
-        # 🚨 FINAL SIGNAL DECISION 🚨
-        # ASTA Signals take priority over simple trendlines
+        # 🚨 FINAL SIGNAL DECISION (MERGED) 🚨
         final_status = tl_status
         if asta_signal != "None":
-            final_status = f"{asta_signal} | {asta_reasons}"
+            if "Watching" in final_status:
+                # If trendline is just watching, show ASTA only
+                final_status = f"{asta_signal} | {asta_reasons}"
+            else:
+                # If we have a TL Breakout AND ASTA, show BOTH
+                final_status = f"{final_status} + {asta_signal}"
         
-        # Filter: Only send if there is SOME signal (ASTA or Trendline)
+        # Filter: Only send if there is SOME signal
         if "Watching" in final_status and asta_signal == "None":
             return # Silence noise
 
