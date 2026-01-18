@@ -1,0 +1,29 @@
+name: Daily Copper Scanner
+
+on:
+  # Schedule runs at 13:00 UTC (approx 6:30 PM IST) daily
+  schedule:
+    - cron: '0 13 * * *'
+  # Allows you to run it manually from the Actions tab for testing
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Market Scanner
+        run: |
+          python market_scanner.py
