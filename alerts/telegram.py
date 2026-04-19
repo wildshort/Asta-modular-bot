@@ -1,7 +1,9 @@
 """
 Telegram delivery + charting.
 
-v5 changes:
+v5.1 changes:
+  - FIX: Normalize MultiIndex columns from yfinance before chart build
+    (fixes KeyError: 'Close' on single-symbol downloads).
   - Isolated trendline computation in a try/except so a bug there can never
     block a chart being sent. If trendline logic fails, chart renders with
     just Donchian channel + indicators.
@@ -179,8 +181,19 @@ def _compute_trendlines_safe(df: pd.DataFrame, symbol: str) -> tuple[list[dict],
         return [], "Watching"
 
 
+def _normalize_ohlc_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    yfinance can return columns as either flat ('Close') or MultiIndex
+    (('Close', 'SIEMENS.NS')). Flatten to first level so df['Close'] always works.
+    """
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.copy()
+        df.columns = df.columns.get_level_values(0)
+    return df
+
+
 def _compute_trendlines_inner(df: pd.DataFrame, symbol: str) -> tuple[list[dict], str]:
-    df = df.copy().reset_index(drop=True)
+    df = _normalize_ohlc_columns(df).copy().reset_index(drop=True)
     n = len(df)
     if n < 30:
         return [], "Watching"
@@ -290,7 +303,7 @@ def _compute_trendlines_inner(df: pd.DataFrame, symbol: str) -> tuple[list[dict]
 
 # ---------- chart ----------
 def _build_chart(symbol: str, df: pd.DataFrame, title_suffix: str, title_color: str) -> bytes:
-    df = df.copy()
+    df = _normalize_ohlc_columns(df).copy()
     df["EMA_50"] = df["Close"].ewm(span=50, adjust=False).mean()
     df["EMA_5"]  = df["Close"].ewm(span=5,  adjust=False).mean()
     _, df["BB_Upper"], df["BB_Lower"] = bollinger(df["Close"])
