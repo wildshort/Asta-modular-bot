@@ -49,9 +49,25 @@ def _maybe_drop_unclosed(df: pd.DataFrame, interval: str) -> pd.DataFrame:
 
 
 def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """yfinance returns MultiIndex columns on multi-symbol downloads. Flatten."""
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
+    """
+    yfinance may return MultiIndex columns. With group_by='ticker', format is
+    (ticker, field) — e.g. ('SIEMENS.NS', 'Close'). We want just the field names
+    so downstream code can do df['Close']. Detect which level holds OHLC field
+    names and flatten to that.
+    """
+    if not isinstance(df.columns, pd.MultiIndex):
+        return df
+    ohlc_fields = {"Open", "High", "Low", "Close", "Volume", "Adj Close"}
+    # Try each level; pick the one with OHLC field names
+    for level in range(df.columns.nlevels):
+        level_vals = set(df.columns.get_level_values(level))
+        if level_vals & ohlc_fields:
+            df = df.copy()
+            df.columns = df.columns.get_level_values(level)
+            return df
+    # Fallback: flatten with level 0
+    df = df.copy()
+    df.columns = df.columns.get_level_values(0)
     return df
 
 
