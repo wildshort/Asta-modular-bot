@@ -1,0 +1,77 @@
+name: Daily Stock Scan
+
+on:
+  schedule:
+    # Cron runs in UTC. 04:00 UTC = 09:30 IST; 09:45 UTC = 15:15 IST (Mon–Fri)
+    - cron: "0 4 * * 1-5"
+    - cron: "45 9 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "daily-stock-scan"
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: ${{ github.workspace }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ✅ FIXED: Telegram secrets now passed via env so the scanner can read them.
+      # ✅ FIXED: Calls main.py (credentials check + better logging) instead of running stock_scanner.py directly.
+      - name: Run scanner
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          mkdir -p scanner/output
+          python main.py
+
+      - name: Show results in Summary
+        if: always()
+        run: |
+          echo "## 📊 Scan Results" >> $GITHUB_STEP_SUMMARY
+          if [ -f scanner/output/latest.json ]; then
+            echo '```json' >> $GITHUB_STEP_SUMMARY
+            cat scanner/output/latest.json >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "_No output file found. See logs below._" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ -d logs ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Log tail" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            tail -n 80 logs/*.log 2>/dev/null || echo "No logs captured."
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload scan artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-results
+          path: |
+            scanner/output/*
+            logs/*
+          if-no-files-found: warn
