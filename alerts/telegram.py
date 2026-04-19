@@ -1,23 +1,23 @@
 """
 Telegram delivery + charting.
 
-v4 changes — proper trendline drawing:
-  1. Regression-validated trendlines: fit a line through pivot clusters,
-     keep only if the fit is tight (low normalized residuals) AND at least
-     3 pivots actually touch the line.
-  2. Donchian channel overlay (20-bar recent high/low) — always drawn.
-  3. Key horizontal level: the price most "respected" by recent pivots
-     (where price bounced the most times within 0.5 ATR).
-  4. Breakout state computed from whichever line price is interacting with,
-     not from a single arbitrary max/min.
-  5. All lines drawn only over their "live" range (not extended back to day 1)
-     so charts stay readable.
+v5 changes:
+  - Isolated trendline computation in a try/except so a bug there can never
+    block a chart being sent. If trendline logic fails, chart renders with
+    just Donchian channel + indicators.
+  - Fixed positional-index bugs in pivot handling.
+  - Explicit loud logging of any chart-send failure so workflow logs show
+    exactly what went wrong.
+
+Everything v4 does (regression-validated trendlines, ATR-scaled tolerance,
+Donchian overlay, key level detection) is still here — just hardened.
 """
 from __future__ import annotations
 
 import io
 import logging
 import time
+import traceback
 from typing import Optional
 
 import matplotlib
@@ -44,15 +44,15 @@ log = logging.getLogger(__name__)
 CHART_PERIOD = "1y"
 _API = "https://api.telegram.org"
 
-# ------------------ trendline tuning ------------------
-_PIVOT_ORDER         = 5      # bars either side for pivot detection
-_MIN_TOUCHES         = 3      # a line must touch ≥ N pivots to be kept
-_TOUCH_TOLERANCE_ATR = 0.5    # "touch" = within 0.5 ATR of the line
-_LOOKBACK_BARS       = 120    # only consider pivots within last N bars
-_DONCHIAN_LEN        = 20     # Donchian channel length
+# trendline tuning
+_PIVOT_ORDER         = 5
+_MIN_TOUCHES         = 3
+_TOUCH_TOLERANCE_ATR = 0.5
+_LOOKBACK_BARS       = 120
+_DONCHIAN_LEN        = 20
 
 
-# ---------- basic plumbing ----------
+# ---------- low-level sender ----------
 def _post_with_retry(url: str, max_attempts: int = 4, **kwargs) -> bool:
     for attempt in range(1, max_attempts + 1):
         try:
@@ -93,7 +93,6 @@ def _find_pivots(values: np.ndarray, kind: str, order: int = _PIVOT_ORDER) -> np
     if _HAS_SCIPY:
         cmp = np.greater if kind == "high" else np.less
         return argrelextrema(values, cmp, order=order)[0]
-    # numpy fallback
     out = []
     for i in range(order, len(values) - order):
         window = values[i - order : i + order + 1]
@@ -109,14 +108,6 @@ def _fit_trendline(
     kind: str,
     atr_val: float,
 ) -> Optional[dict]:
-    """
-    Given pivot indices + values, find the best-fit line that:
-      - has the expected slope direction (resistance usually flat/down, support flat/up)
-      - is touched by >= _MIN_TOUCHES pivots within tolerance
-      - has tight fit (low residuals relative to ATR)
-
-    Returns dict with slope, intercept, start_idx, end_idx, touches — or None.
-    """
     n = len(pivot_idx)
     if n < _MIN_TOUCHES or atr_val <= 0:
         return None
@@ -124,42 +115,33 @@ def _fit_trendline(
     best = None
     tol = _TOUCH_TOLERANCE_ATR * atr_val
 
-    # Try every pair of pivots as line anchors, score by touch count + fit
     for a in range(n - 1):
         for b in range(a + 1, n):
-            x1, y1 = pivot_idx[a], pivot_val[a]
-            x2, y2 = pivot_idx[b], pivot_val[b]
+            x1, y1 = float(pivot_idx[a]), float(pivot_val[a])
+            x2, y2 = float(pivot_idx[b]), float(pivot_val[b])
             if x2 == x1:
                 continue
             slope = (y2 - y1) / (x2 - x1)
 
-            # Prefer shallow slopes for real trendlines
-            # Resistance: slope should be <= 0 (ideally flat or descending)
-            # Support:    slope should be >= 0 (ideally flat or ascending)
-            if kind == "high" and slope > abs(atr_val) * 0.1:
+            # slope sanity checks
+            if kind == "high" and slope > atr_val * 0.1:
                 continue
-            if kind == "low" and slope < -abs(atr_val) * 0.1:
+            if kind == "low" and slope < -atr_val * 0.1:
                 continue
 
-            # Count touches among all pivots
-            line_vals = y1 + slope * (pivot_idx - x1)
-            dists = np.abs(pivot_val - line_vals)
+            line_vals = y1 + slope * (pivot_idx.astype(float) - x1)
+            dists = np.abs(pivot_val.astype(float) - line_vals)
             touches = int((dists <= tol).sum())
             if touches < _MIN_TOUCHES:
                 continue
 
-            # For a resistance line, no pivot high should be significantly ABOVE it
-            # (price breaking above would invalidate the line during formation)
             if kind == "high":
-                excess = (pivot_val - line_vals) > tol
-                if excess.any():
+                if ((pivot_val.astype(float) - line_vals) > tol).any():
                     continue
             else:
-                below = (line_vals - pivot_val) > tol
-                if below.any():
+                if ((line_vals - pivot_val.astype(float)) > tol).any():
                     continue
 
-            # Score: more touches is better; tighter fit (smaller mean dist) is better
             mean_dist = float(np.mean(dists[dists <= tol]))
             score = touches - (mean_dist / tol) * 0.5
 
@@ -172,57 +154,51 @@ def _fit_trendline(
                     "touches": touches,
                     "score": float(score),
                 }
-
     return best
 
 
-def _key_horizontal_level(
-    pivot_idx: np.ndarray,
-    pivot_val: np.ndarray,
-    atr_val: float,
-) -> Optional[float]:
-    """
-    Find the price level that the most pivots cluster around.
-    Useful for showing 'this is the level price keeps respecting'.
-    """
+def _key_horizontal_level(pivot_val: np.ndarray, atr_val: float) -> Optional[float]:
     if len(pivot_val) < 3 or atr_val <= 0:
         return None
+    pivot_val = pivot_val.astype(float)
     bucket = _TOUCH_TOLERANCE_ATR * atr_val
-    # For each pivot, count how many other pivots are within bucket distance
-    counts = []
-    for v in pivot_val:
-        c = int(np.sum(np.abs(pivot_val - v) <= bucket))
-        counts.append((c, v))
+    counts = [(int(np.sum(np.abs(pivot_val - v) <= bucket)), float(v)) for v in pivot_val]
     counts.sort(reverse=True)
     if counts[0][0] < 3:
         return None
-    return float(counts[0][1])
+    return counts[0][1]
 
 
-# ---------- main trendline computation ----------
-def _compute_trendlines(df: pd.DataFrame, symbol: str) -> tuple[list[dict], str]:
+def _compute_trendlines_safe(df: pd.DataFrame, symbol: str) -> tuple[list[dict], str]:
+    """Wrapper that never raises. Returns empty list on any failure."""
+    try:
+        return _compute_trendlines_inner(df, symbol)
+    except Exception as e:
+        log.warning(f"[{symbol}] trendline calc failed ({type(e).__name__}: {e}); chart will skip trendlines")
+        log.debug(traceback.format_exc())
+        return [], "Watching"
+
+
+def _compute_trendlines_inner(df: pd.DataFrame, symbol: str) -> tuple[list[dict], str]:
     df = df.copy().reset_index(drop=True)
     n = len(df)
     if n < 30:
         return [], "Watching"
 
-    # Restrict pivot search to the recent lookback window — old trendlines become irrelevant
     lookback_start = max(0, n - _LOOKBACK_BARS)
-    slice_high = df["High"].iloc[lookback_start:].values
-    slice_low  = df["Low"].iloc[lookback_start:].values
+    high_vals = df["High"].astype(float).values
+    low_vals  = df["Low"].astype(float).values
 
-    high_piv_rel = _find_pivots(slice_high, "high")
-    low_piv_rel  = _find_pivots(slice_low,  "low")
-    # Convert back to absolute indices
-    high_piv = (high_piv_rel + lookback_start).astype(int)
-    low_piv  = (low_piv_rel  + lookback_start).astype(int)
+    high_piv_rel = _find_pivots(high_vals[lookback_start:], "high")
+    low_piv_rel  = _find_pivots(low_vals[lookback_start:],  "low")
+    high_piv = (np.asarray(high_piv_rel) + lookback_start).astype(int)
+    low_piv  = (np.asarray(low_piv_rel)  + lookback_start).astype(int)
 
-    # Average True Range for tolerance scaling
     atr_series = atr_calc(df["High"], df["Low"], df["Close"])
     atr_val = float(atr_series.iloc[-1]) if pd.notna(atr_series.iloc[-1]) else 0.0
 
     log.info(
-        f"[{symbol}] pivots over last {_LOOKBACK_BARS} bars: "
+        f"[{symbol}] pivots in last {_LOOKBACK_BARS} bars: "
         f"{len(high_piv)} highs / {len(low_piv)} lows, ATR={atr_val:.2f}"
     )
 
@@ -231,95 +207,78 @@ def _compute_trendlines(df: pd.DataFrame, symbol: str) -> tuple[list[dict], str]
     last_idx = n - 1
     last_close = float(df["Close"].iloc[-1])
 
-    # ---- Resistance ----
+    # Resistance
     if len(high_piv) >= _MIN_TOUCHES:
-        pvals = df["High"].values[high_piv].astype(float)
+        pvals = high_vals[high_piv]
         res = _fit_trendline(high_piv, pvals, "high", atr_val)
         if res:
-            y_now = res["intercept"] + res["slope"] * last_idx
+            y_now   = res["intercept"] + res["slope"] * last_idx
             y_start = res["intercept"] + res["slope"] * res["start_idx"]
             lines.append({
                 "x": [res["start_idx"], last_idx],
                 "y": [y_start, y_now],
                 "color": "#D32F2F",
-                "label": f"Resistance ({res['touches']} touches)",
+                "label": f"Resistance ({res['touches']}t)",
                 "style": "-",
                 "lw": 2.0,
             })
             if last_close > y_now + _TOUCH_TOLERANCE_ATR * atr_val:
                 status = "🚀 TL BREAKOUT"
-            log.info(f"[{symbol}] resistance: slope={res['slope']:.3f}, touches={res['touches']}")
 
-    # ---- Support ----
+    # Support
     if len(low_piv) >= _MIN_TOUCHES:
-        pvals = df["Low"].values[low_piv].astype(float)
+        pvals = low_vals[low_piv]
         sup = _fit_trendline(low_piv, pvals, "low", atr_val)
         if sup:
-            y_now = sup["intercept"] + sup["slope"] * last_idx
+            y_now   = sup["intercept"] + sup["slope"] * last_idx
             y_start = sup["intercept"] + sup["slope"] * sup["start_idx"]
             lines.append({
                 "x": [sup["start_idx"], last_idx],
                 "y": [y_start, y_now],
                 "color": "#2E7D32",
-                "label": f"Support ({sup['touches']} touches)",
+                "label": f"Support ({sup['touches']}t)",
                 "style": "-",
                 "lw": 2.0,
             })
             if last_close < y_now - _TOUCH_TOLERANCE_ATR * atr_val:
                 status = "🔻 TL BREAKDOWN"
-            log.info(f"[{symbol}] support: slope={sup['slope']:.3f}, touches={sup['touches']}")
 
-    # ---- Key horizontal level ----
-    all_piv_idx = np.concatenate([high_piv, low_piv]) if (len(high_piv) or len(low_piv)) else np.array([])
-    all_piv_val = np.concatenate([
-        df["High"].values[high_piv] if len(high_piv) else np.array([]),
-        df["Low"].values[low_piv] if len(low_piv) else np.array([]),
-    ])
-    key_level = _key_horizontal_level(all_piv_idx, all_piv_val, atr_val)
-    if key_level is not None:
-        # Only draw if sufficiently different from existing sloped lines at current bar
-        too_close = False
-        for ln in lines:
-            if abs(ln["y"][-1] - key_level) < atr_val * 0.5:
-                too_close = True
-                break
-        if not too_close:
-            start_idx = max(0, n - _LOOKBACK_BARS)
-            lines.append({
-                "x": [start_idx, last_idx],
-                "y": [key_level, key_level],
-                "color": "#FFA000",
-                "label": f"Key Level ₹{key_level:.0f}",
-                "style": ":",
-                "lw": 1.8,
-            })
-            log.info(f"[{symbol}] key horizontal level: {key_level:.2f}")
+    # Key level
+    if len(high_piv) or len(low_piv):
+        all_piv_val = np.concatenate([
+            high_vals[high_piv] if len(high_piv) else np.array([]),
+            low_vals[low_piv]   if len(low_piv)  else np.array([]),
+        ])
+        kl = _key_horizontal_level(all_piv_val, atr_val)
+        if kl is not None:
+            too_close = any(abs(ln["y"][-1] - kl) < atr_val * 0.5 for ln in lines)
+            if not too_close:
+                start_idx = max(0, n - _LOOKBACK_BARS)
+                lines.append({
+                    "x": [start_idx, last_idx],
+                    "y": [kl, kl],
+                    "color": "#FFA000",
+                    "label": f"Key ₹{kl:.0f}",
+                    "style": ":",
+                    "lw": 1.8,
+                })
 
-    # ---- Donchian channel overlay (always drawn) ----
+    # Donchian — always drawn
     if n >= _DONCHIAN_LEN + 1:
-        recent = df.iloc[-(_DONCHIAN_LEN + 1):-1]   # last N complete bars, excluding current
+        recent = df.iloc[-(_DONCHIAN_LEN + 1):-1]
         dc_high = float(recent["High"].max())
         dc_low  = float(recent["Low"].min())
         start_idx = n - _DONCHIAN_LEN - 1
         lines.append({
-            "x": [start_idx, last_idx],
-            "y": [dc_high, dc_high],
-            "color": "#C62828",
-            "label": f"{_DONCHIAN_LEN}D High",
-            "style": "--",
-            "lw": 1.0,
-            "alpha": 0.55,
+            "x": [start_idx, last_idx], "y": [dc_high, dc_high],
+            "color": "#C62828", "label": f"{_DONCHIAN_LEN}D High",
+            "style": "--", "lw": 1.0, "alpha": 0.55,
         })
         lines.append({
-            "x": [start_idx, last_idx],
-            "y": [dc_low, dc_low],
-            "color": "#388E3C",
-            "label": f"{_DONCHIAN_LEN}D Low",
-            "style": "--",
-            "lw": 1.0,
-            "alpha": 0.55,
+            "x": [start_idx, last_idx], "y": [dc_low, dc_low],
+            "color": "#388E3C", "label": f"{_DONCHIAN_LEN}D Low",
+            "style": "--", "lw": 1.0, "alpha": 0.55,
         })
-        # If no sloped line triggered status, still detect Donchian breakout
         if status == "Watching":
             if last_close > dc_high:
                 status = "🚀 20D BREAKOUT"
@@ -339,7 +298,7 @@ def _build_chart(symbol: str, df: pd.DataFrame, title_suffix: str, title_color: 
     m_line, s_line, h = macd_calc(df["Close"])
     df["MACD"], df["Signal"], df["Hist"] = m_line, s_line, h
 
-    trend_lines, tl_status = _compute_trendlines(df, symbol)
+    trend_lines, tl_status = _compute_trendlines_safe(df, symbol)
     log.info(f"[{symbol}] drawing {len(trend_lines)} lines, status={tl_status}")
 
     df_plot = df.reset_index()
@@ -363,7 +322,6 @@ def _build_chart(symbol: str, df: pd.DataFrame, title_suffix: str, title_color: 
     ax1.plot(x, df_plot["BB_Lower"], color="blue", lw=0.5, alpha=0.4)
     ax1.fill_between(x, df_plot["BB_Upper"], df_plot["BB_Lower"], color="blue", alpha=0.05)
 
-    # Draw trendlines on top (zorder=5)
     for line in trend_lines:
         ax1.plot(line["x"], line["y"],
                  color=line["color"],
@@ -417,12 +375,16 @@ def _build_chart(symbol: str, df: pd.DataFrame, title_suffix: str, title_color: 
 
 def send_chart(symbol: str, direction: str = "", score: float = 0.0) -> bool:
     if not TELEGRAM_TOKEN or not CHAT_ID:
+        log.warning(f"[{symbol}] send_chart: missing Telegram creds, skipping")
         return False
+
     try:
+        log.info(f"[{symbol}] send_chart: downloading data...")
         df = download_single(symbol, period=CHART_PERIOD, interval="1d")
         if df is None or df.empty:
-            log.warning(f"No chart data for {symbol}")
+            log.warning(f"[{symbol}] send_chart: no data returned")
             return False
+        log.info(f"[{symbol}] send_chart: got {len(df)} bars, building chart...")
 
         if direction == "Bullish":
             title_suffix = f"📈 BULLISH (Score {score:.0f}/100)"
@@ -435,6 +397,7 @@ def send_chart(symbol: str, direction: str = "", score: float = 0.0) -> bool:
             title_color = "black"
 
         png_bytes = _build_chart(symbol, df, title_suffix, title_color)
+        log.info(f"[{symbol}] send_chart: built {len(png_bytes)} byte PNG, uploading...")
 
         caption = f"📊 {symbol}  |  {title_suffix}"
         ok = _post_with_retry(
@@ -443,8 +406,12 @@ def send_chart(symbol: str, direction: str = "", score: float = 0.0) -> bool:
             data={"chat_id": CHAT_ID, "caption": caption},
         )
         if ok:
-            log.info(f"Chart sent for {symbol}")
+            log.info(f"[{symbol}] ✅ Chart sent successfully")
+        else:
+            log.error(f"[{symbol}] ❌ Telegram sendPhoto failed after retries")
         return ok
+
     except Exception as e:
-        log.warning(f"Chart send failed for {symbol}: {e}", exc_info=True)
+        log.error(f"[{symbol}] ❌ send_chart FAILED: {type(e).__name__}: {e}")
+        log.error(traceback.format_exc())
         return False
