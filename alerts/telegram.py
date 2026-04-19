@@ -1,13 +1,14 @@
 """
 Telegram delivery + charting.
 
-v5.1 changes:
-  - FIX: Normalize MultiIndex columns from yfinance before chart build
-    (fixes KeyError: 'Close' on single-symbol downloads).
+v5.2 changes:
+  - FIX: Correctly handle yfinance MultiIndex in BOTH orderings
+    (ticker-first from group_by='ticker' AND field-first).
+    Previous v5.1 only handled one direction — real yfinance output with
+    group_by='ticker' was still broken.
   - Isolated trendline computation in a try/except so a bug there can never
     block a chart being sent. If trendline logic fails, chart renders with
     just Donchian channel + indicators.
-  - Fixed positional-index bugs in pivot handling.
   - Explicit loud logging of any chart-send failure so workflow logs show
     exactly what went wrong.
 
@@ -183,12 +184,23 @@ def _compute_trendlines_safe(df: pd.DataFrame, symbol: str) -> tuple[list[dict],
 
 def _normalize_ohlc_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    yfinance can return columns as either flat ('Close') or MultiIndex
-    (('Close', 'SIEMENS.NS')). Flatten to first level so df['Close'] always works.
+    yfinance can return MultiIndex columns in two formats depending on group_by:
+      - ('Close', 'SIEMENS.NS')  — field first, ticker second
+      - ('SIEMENS.NS', 'Close')  — ticker first, field second  (group_by='ticker')
+    Detect which level has OHLC field names and flatten to that.
     """
-    if isinstance(df.columns, pd.MultiIndex):
-        df = df.copy()
-        df.columns = df.columns.get_level_values(0)
+    if not isinstance(df.columns, pd.MultiIndex):
+        return df
+    ohlc_fields = {"Open", "High", "Low", "Close", "Volume", "Adj Close"}
+    for level in range(df.columns.nlevels):
+        level_vals = set(df.columns.get_level_values(level))
+        if level_vals & ohlc_fields:
+            df = df.copy()
+            df.columns = df.columns.get_level_values(level)
+            return df
+    # Fallback
+    df = df.copy()
+    df.columns = df.columns.get_level_values(0)
     return df
 
 
@@ -428,3 +440,4 @@ def send_chart(symbol: str, direction: str = "", score: float = 0.0) -> bool:
         log.error(f"[{symbol}] ❌ send_chart FAILED: {type(e).__name__}: {e}")
         log.error(traceback.format_exc())
         return False
+
