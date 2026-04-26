@@ -27,32 +27,21 @@ MIN_BARS = 60                # need enough history to find pivots and classify t
 MIN_TURNOVER_INR_CR = 50.0   # skip illiquid names; ₹50 cr/day is a soft floor
 
 
-def _drop_unclosed_bar(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Match the convention from the existing scanner: never evaluate the
-    in-progress bar. yfinance returns the live bar for today during market
-    hours; we want only fully closed bars in our analysis.
-    """
-    if df.empty:
-        return df
-    today = pd.Timestamp.now(tz=df.index.tz).normalize() if df.index.tz else pd.Timestamp.now().normalize()
-    last_idx = df.index[-1]
-    if hasattr(last_idx, "normalize") and last_idx.normalize() == today:
-        return df.iloc[:-1]
-    return df
-
-
 def scan_one(ticker: str, df: pd.DataFrame) -> dict[str, Any] | None:
     """
     Scan a single ticker. Returns a signal dict if ChoCH is detected, else None.
 
     Expected df columns: Open, High, Low, Close, Volume.
+    NOTE: utils.fetcher.download_bulk already drops the unclosed bar — we don't
+    repeat that work here.
     """
-    if df is None or df.empty:
+    if df is None or df.empty or len(df) < MIN_BARS:
         return None
 
-    df = _drop_unclosed_bar(df)
-    if len(df) < MIN_BARS:
+    # Sanity check for required columns
+    required = {"High", "Low", "Close", "Volume"}
+    if not required.issubset(df.columns):
+        log.debug("%s: missing required columns, got %s", ticker, list(df.columns))
         return None
 
     high = df["High"]
@@ -61,7 +50,8 @@ def scan_one(ticker: str, df: pd.DataFrame) -> dict[str, Any] | None:
     volume = df["Volume"]
 
     atr14 = atr(high, low, close, length=14)
-    if atr14.iloc[-1] is None or pd.isna(atr14.iloc[-1]) or atr14.iloc[-1] <= 0:
+    last_atr = atr14.iloc[-1]
+    if pd.isna(last_atr) or last_atr <= 0:
         return None
 
     # Liquidity filter — skip thinly traded names.
@@ -105,7 +95,7 @@ def scan_one(ticker: str, df: pd.DataFrame) -> dict[str, Any] | None:
 def scan_watchlist(price_data: dict[str, pd.DataFrame]) -> list[dict[str, Any]]:
     """
     Scan all tickers. `price_data` is a dict {ticker: ohlcv_dataframe}, the same
-    shape returned by utils.fetcher's batch download.
+    shape returned by utils.fetcher.download_bulk.
     """
     signals: list[dict[str, Any]] = []
     for ticker, df in price_data.items():
@@ -123,16 +113,17 @@ def format_telegram_message(signal: dict[str, Any]) -> str:
     """Visually distinct from the continuation scanner's message format."""
     direction_emoji = "🟢" if signal["direction"] == "Bullish" else "🔴"
     arrow = "↗" if signal["direction"] == "Bullish" else "↘"
+    pivot_kind = "high" if signal["direction"] == "Bullish" else "low"
     return (
-        f"🔄 *ChoCH Alert | Daily*\n\n"
-        f"{direction_emoji} *{signal['ticker']}*  |  ₹{signal['price']:.2f} ({signal['pct_change']:+.2f}%)\n"
+        f"🔄 ChoCH Alert | Daily\n\n"
+        f"{direction_emoji} {signal['ticker']}  |  ₹{signal['price']:.2f} ({signal['pct_change']:+.2f}%)\n"
         f"🎯 Direction      : {signal['direction']} {arrow} "
         f"({signal['prior_trend']} → reversal)\n"
         f"📍 Broke level    : ₹{signal['break_level']:.2f}  "
-        f"(swing {signal['prior_trend'].lower()[:-5]} on {signal['break_level_date']})\n"
+        f"(swing {pivot_kind} on {signal['break_level_date']})\n"
         f"📏 Break strength : {signal['break_strength_atr']}× ATR past level\n"
         f"📊 RSI Daily      : {signal['rsi']}\n"
         f"💧 Turnover       : ₹{signal['avg_turnover_cr']} cr/day\n"
-        f"\n_First reversal signal after a sustained "
-        f"{signal['prior_trend'].lower()}. Watch for follow-through._"
+        f"\nFirst reversal signal after a sustained "
+        f"{signal['prior_trend'].lower()}. Watch for follow-through."
     )
