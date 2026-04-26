@@ -1,5 +1,6 @@
+
 """
-Entry point for the ChoCH trial scanner.
+Entry point for the ChoCH + Fib trial scanner.
 
 Run via:
     python choch_main.py
@@ -19,7 +20,6 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-# --- Imports matched to the actual repo ---
 from utils.fetcher import download_bulk
 from alerts.telegram import send_telegram
 from watchlist.nifty_stocks import watchlist
@@ -56,15 +56,12 @@ def check_credentials() -> bool:
 
 def main() -> int:
     log.info("=" * 60)
-    log.info("ChoCH trial scanner starting")
+    log.info("ChoCH + Fib trial scanner starting")
     log.info("=" * 60)
 
     if not check_credentials():
         return 1
 
-    # The watchlist mixes NSE equities (.NS) and commodity futures (=F).
-    # ChoCH on commodities is meaningful too, but for a clean trial keep
-    # only equities — commodity volume/turnover semantics differ.
     all_symbols = list(watchlist)
     equity_symbols = [s for s in all_symbols if s.endswith(".NS")]
     log.info(
@@ -79,13 +76,12 @@ def main() -> int:
 
     if not price_data:
         log.error("No price data returned — aborting.")
-        send_telegram("⚠️ ChoCH trial: no price data returned from fetcher.")
+        send_telegram("⚠️ ChoCH+Fib trial: no price data returned from fetcher.")
         return 2
 
     signals = scan_watchlist(price_data)
-    log.info("Scan complete. %d ChoCH signals detected.", len(signals))
+    log.info("Scan complete. %d ChoCH+Fib setups detected.", len(signals))
 
-    # Persist results for the GitHub Actions Run Summary.
     output_path = OUTPUT_DIR / "choch_latest.json"
     with output_path.open("w") as f:
         json.dump(
@@ -102,13 +98,11 @@ def main() -> int:
     log.info("Wrote results to %s", output_path)
 
     if not signals:
-        # Heartbeat so we know the run actually executed.
         send_telegram(
-            f"🔄 ChoCH trial run: 0 signals across {len(price_data)} tickers."
+            f"🎯 ChoCH+Fib trial: 0 setups across {len(price_data)} tickers."
         )
         return 0
 
-    # Send each signal as its own Telegram message.
     sent = 0
     for sig in signals:
         msg = format_telegram_message(sig)
@@ -116,13 +110,16 @@ def main() -> int:
             ok = send_telegram(msg)
             if ok:
                 sent += 1
-                log.info("Sent: %s %s", sig["ticker"], sig["direction"])
+                log.info(
+                    "Sent: %s %s @ %.1f%% retracement",
+                    sig["ticker"], sig["direction"], sig["current_retracement_pct"],
+                )
             else:
                 log.warning("send_telegram returned False for %s", sig["ticker"])
         except Exception:
-            log.exception("Failed to send Telegram message for %s", sig["ticker"])
+            log.exception("Failed to send message for %s", sig["ticker"])
 
-    log.info("Sent %d/%d signal messages.", sent, len(signals))
+    log.info("Sent %d/%d setup messages.", sent, len(signals))
     return 0
 
 
