@@ -209,8 +209,99 @@ def find_recent_choch(
     return null_result
 
 
+def find_anchor_low_for_bullish_choch(
+    high: pd.Series,
+    low: pd.Series,
+    pivots: list[Pivot],
+    choch_bar: int,
+    max_lookback: int = 90,
+) -> Optional[tuple[float, pd.Timestamp]]:
+    """
+    Find the structural low that anchors a Bullish ChoCH Fib draw.
+
+    Logic: a Bullish ChoCH happens when price breaks above the most recent
+    swing high. The "leg" we want to Fib is the move FROM the bottom of
+    the prior downtrend TO the ChoCH break. That bottom is the lowest bar
+    between the SECOND-to-last swing high (where the latest leg-down began)
+    and the ChoCH break bar.
+
+    Why not just take the lowest swing low? Because that picks deep historical
+    lows from many months ago, far outside the current move structure.
+
+    Returns (price, date) or None if no valid anchor found.
+    """
+    # Find the swing high BEFORE the one that just got broken — this marks
+    # the start of the latest downleg.
+    highs_before = [
+        p for p in pivots
+        if p.kind == "high" and p.index < choch_bar
+    ]
+    if len(highs_before) < 2:
+        # Not enough structure; fall back to a simple lookback window
+        leg_start = max(0, choch_bar - max_lookback)
+    else:
+        # Use the second-to-last swing high as the start of the downleg.
+        # (The last swing high is the one that just got broken — we want to
+        # look for the low that came AFTER the previous high, BEFORE the broken one.)
+        prior_high = highs_before[-2]
+        leg_start = prior_high.index
+        # Cap the lookback in case the structure is weird
+        leg_start = max(leg_start, choch_bar - max_lookback)
+
+    # Within [leg_start, choch_bar], find the lowest bar.
+    if leg_start >= choch_bar:
+        return None
+
+    leg_lows = low.iloc[leg_start : choch_bar + 1]
+    if leg_lows.empty:
+        return None
+
+    anchor_price = float(leg_lows.min())
+    anchor_date = leg_lows.idxmin()
+    return anchor_price, anchor_date
+
+
+def find_anchor_high_for_bearish_choch(
+    high: pd.Series,
+    low: pd.Series,
+    pivots: list[Pivot],
+    choch_bar: int,
+    max_lookback: int = 90,
+) -> Optional[tuple[float, pd.Timestamp]]:
+    """
+    Mirror of find_anchor_low_for_bullish_choch.
+
+    For a Bearish ChoCH, the relevant high is the top of the upleg that
+    just got reversed — i.e., the highest bar between the previous swing
+    low and the ChoCH break.
+    """
+    lows_before = [
+        p for p in pivots
+        if p.kind == "low" and p.index < choch_bar
+    ]
+    if len(lows_before) < 2:
+        leg_start = max(0, choch_bar - max_lookback)
+    else:
+        prior_low = lows_before[-2]
+        leg_start = prior_low.index
+        leg_start = max(leg_start, choch_bar - max_lookback)
+
+    if leg_start >= choch_bar:
+        return None
+
+    leg_highs = high.iloc[leg_start : choch_bar + 1]
+    if leg_highs.empty:
+        return None
+
+    anchor_price = float(leg_highs.max())
+    anchor_date = leg_highs.idxmax()
+    return anchor_price, anchor_date
+
+
+# --- Deprecated old functions kept as no-ops to avoid import errors ---
+# (The new functions above replace these.)
 def find_anchor_low_before(pivots: list[Pivot], up_to_bar: int) -> Optional[Pivot]:
-    """The lowest swing low at or before `up_to_bar`. Used as Fib anchor for Bullish ChoCH."""
+    """DEPRECATED — use find_anchor_low_for_bullish_choch instead."""
     relevant_lows = [p for p in pivots if p.kind == "low" and p.index <= up_to_bar]
     if not relevant_lows:
         return None
@@ -218,7 +309,7 @@ def find_anchor_low_before(pivots: list[Pivot], up_to_bar: int) -> Optional[Pivo
 
 
 def find_anchor_high_before(pivots: list[Pivot], up_to_bar: int) -> Optional[Pivot]:
-    """The highest swing high at or before `up_to_bar`. Used as Fib anchor for Bearish ChoCH."""
+    """DEPRECATED — use find_anchor_high_for_bearish_choch instead."""
     relevant_highs = [p for p in pivots if p.kind == "high" and p.index <= up_to_bar]
     if not relevant_highs:
         return None
