@@ -1,7 +1,6 @@
-name: ChoCH Trial Scan
+name: ChoCH + Fib Trial Scan
 
 # TRIAL: manual trigger only — no cron schedule yet.
-# After a few good runs, we'll add a `schedule:` block here.
 on:
   workflow_dispatch:
 
@@ -9,7 +8,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: "choch-trial-scan"
+  group: "choch-fib-trial-scan"
   cancel-in-progress: false
 
 jobs:
@@ -35,7 +34,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run ChoCH scanner
+      - name: Run ChoCH+Fib scanner
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -46,7 +45,7 @@ jobs:
       - name: Show results in Summary
         if: always()
         run: |
-          echo "## 🔄 ChoCH Trial Results" >> $GITHUB_STEP_SUMMARY
+          echo "## 🎯 ChoCH + Fib Trial Results" >> $GITHUB_STEP_SUMMARY
           if [ -f scanner/output/choch_latest.json ]; then
             echo '```json' >> $GITHUB_STEP_SUMMARY
             cat scanner/output/choch_latest.json >> $GITHUB_STEP_SUMMARY
@@ -66,7 +65,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: choch-trial-results
+          name: choch-fib-trial-results
           path: |
             scanner/output/choch_latest.json
             logs/*
