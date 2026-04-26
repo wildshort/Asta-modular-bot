@@ -1,0 +1,73 @@
+name: ChoCH Trial Scan
+
+# TRIAL: manual trigger only — no cron schedule yet.
+# After a few good runs, we'll add a `schedule:` block here.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "choch-trial-scan"
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: ${{ github.workspace }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run ChoCH scanner
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          mkdir -p scanner/output
+          python choch_main.py
+
+      - name: Show results in Summary
+        if: always()
+        run: |
+          echo "## 🔄 ChoCH Trial Results" >> $GITHUB_STEP_SUMMARY
+          if [ -f scanner/output/choch_latest.json ]; then
+            echo '```json' >> $GITHUB_STEP_SUMMARY
+            cat scanner/output/choch_latest.json >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "_No output file found. See logs below._" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ -d logs ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Log tail" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            tail -n 80 logs/*.log 2>/dev/null || echo "No logs captured."
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: choch-trial-results
+          path: |
+            scanner/output/choch_latest.json
+            logs/*
+          if-no-files-found: warn
