@@ -1,47 +1,85 @@
 """
-ChoCH scanner — finds Change-of-Character reversal signals across the watchlist.
+ChoCH + Fib scanner — finds setups where:
+  1. A Change-of-Character has occurred within the last 30 trading days, AND
+  2. Price is currently retracing into the 38.2%–61.8% Fibonacci zone
+     of the move from the structural low (or high) to the ChoCH break point.
 
-Kept intentionally separate from stock_scanner.py so:
-  - It can run on its own schedule (or just manually for the trial)
-  - A failure here doesn't break the continuation breakout scanner
-  - The Telegram message format can be visually distinct
+This is significantly more selective than ChoCH alone — most days zero alerts,
+occasional days 1-3 high-quality entry setups.
 """
 from __future__ import annotations
 
 import logging
-from dataclasses import asdict
-from typing import Any
+from typing import Any, Optional
 
 import pandas as pd
 
 from utils.indicators import atr, rsi
-from utils.pivots import detect_choch, ChochResult
+from utils.pivots import (
+    find_pivots,
+    find_recent_choch,
+    find_anchor_low_before,
+    find_anchor_high_before,
+    ChochResult,
+    Pivot,
+)
 
 log = logging.getLogger(__name__)
 
 
-# --- Tuning constants. Trial defaults. Easy to bump later. ---
-PIVOT_WINDOW = 5             # N bars on each side to confirm a swing pivot
-ATR_MULTIPLIER = 0.3         # how far past the pivot the close must be (in ATR)
-MIN_BARS = 60                # need enough history to find pivots and classify trend
-MIN_TURNOVER_INR_CR = 50.0   # skip illiquid names; ₹50 cr/day is a soft floor
+# --- Tuning constants. Trial defaults. ---
+PIVOT_WINDOW = 5             # bars on each side to confirm a swing pivot
+ATR_MULTIPLIER = 0.3         # ATR-scaled threshold for ChoCH break
+CHOCH_LOOKBACK_BARS = 30     # only consider ChoCH events from last 30 bars
+MIN_BARS = 80                # need enough history (lookback + buffer)
+MIN_TURNOVER_INR_CR = 50.0   # liquidity filter
+
+# Fib zone: 38.2% to 61.8% retracement = "golden pocket"
+FIB_ZONE_MIN = 0.382
+FIB_ZONE_MAX = 0.618
+FIB_LEVELS = [0.382, 0.500, 0.618]   # the levels we report in the message
 
 
-def scan_one(ticker: str, df: pd.DataFrame) -> dict[str, Any] | None:
+def _fib_price(low: float, high: float, ratio: float, direction: str) -> float:
     """
-    Scan a single ticker. Returns a signal dict if ChoCH is detected, else None.
+    Given an anchor low and high, return the price at a given retracement ratio.
 
-    Expected df columns: Open, High, Low, Close, Volume.
-    NOTE: utils.fetcher.download_bulk already drops the unclosed bar — we don't
-    repeat that work here.
+    For a Bullish ChoCH (price rallied from low to high, now retracing down):
+        50% retracement = midpoint between low and high (price coming down from high)
+        ratio=0 means at the high, ratio=1 means at the low.
+
+    For a Bearish ChoCH (price fell from high to low, now retracing up):
+        50% retracement = midpoint (price coming up from low)
+        ratio=0 means at the low, ratio=1 means at the high.
+    """
+    if direction == "Bullish":
+        return high - (high - low) * ratio
+    else:  # Bearish
+        return low + (high - low) * ratio
+
+
+def _current_retracement_pct(price: float, low: float, high: float, direction: str) -> float:
+    """How far has price retraced, as a fraction (0.0 to 1.0+)."""
+    move = high - low
+    if move <= 0:
+        return 0.0
+    if direction == "Bullish":
+        return (high - price) / move
+    else:
+        return (price - low) / move
+
+
+def scan_one(ticker: str, df: pd.DataFrame) -> Optional[dict[str, Any]]:
+    """
+    Scan a single ticker for a ChoCH + Fib entry setup.
+    Returns signal dict if conditions met, else None.
     """
     if df is None or df.empty or len(df) < MIN_BARS:
         return None
 
-    # Sanity check for required columns
     required = {"High", "Low", "Close", "Volume"}
     if not required.issubset(df.columns):
-        log.debug("%s: missing required columns, got %s", ticker, list(df.columns))
+        log.debug("%s: missing columns %s", ticker, list(df.columns))
         return None
 
     high = df["High"]
@@ -54,76 +92,171 @@ def scan_one(ticker: str, df: pd.DataFrame) -> dict[str, Any] | None:
     if pd.isna(last_atr) or last_atr <= 0:
         return None
 
-    # Liquidity filter — skip thinly traded names.
     avg_turnover_cr = float((close * volume).rolling(20).mean().iloc[-1] / 1e7)
     if pd.isna(avg_turnover_cr) or avg_turnover_cr < MIN_TURNOVER_INR_CR:
         return None
 
-    result: ChochResult = detect_choch(
+    # Step 1: find a recent ChoCH event in the last 30 bars
+    choch: ChochResult = find_recent_choch(
         high=high,
         low=low,
         close=close,
         atr_series=atr14,
         pivot_window=PIVOT_WINDOW,
         atr_multiplier=ATR_MULTIPLIER,
+        lookback_bars=CHOCH_LOOKBACK_BARS,
     )
 
-    if result.direction == "None":
+    if choch.direction == "None" or choch.broken_pivot is None:
         return None
 
-    # Add some context an analyst would want when reading the alert.
-    rsi14 = rsi(close, length=14)
+    n = len(close)
+    choch_bar_idx = n - 1 - choch.bars_ago
+
+    # Step 2: identify Fib anchors
+    all_pivots = find_pivots(high, low, window=PIVOT_WINDOW)
+
+    if choch.direction == "Bullish":
+        # Bullish ChoCH = was downtrend, broke up through swing high.
+        # Anchor low = the structural low BEFORE the ChoCH (the bottom of the downtrend)
+        # Anchor high = the high reached at/after the ChoCH break (peak of the rally so far)
+        anchor_low_pivot = find_anchor_low_before(all_pivots, up_to_bar=choch_bar_idx)
+        if anchor_low_pivot is None:
+            return None
+        anchor_low_price = anchor_low_pivot.price
+        anchor_low_date = anchor_low_pivot.bar_date
+        # Highest high from ChoCH bar to current bar is the rally peak
+        post_choch_highs = high.iloc[choch_bar_idx:]
+        anchor_high_price = float(post_choch_highs.max())
+        anchor_high_date = post_choch_highs.idxmax()
+
+    else:  # Bearish
+        anchor_high_pivot = find_anchor_high_before(all_pivots, up_to_bar=choch_bar_idx)
+        if anchor_high_pivot is None:
+            return None
+        anchor_high_price = anchor_high_pivot.price
+        anchor_high_date = anchor_high_pivot.bar_date
+        post_choch_lows = low.iloc[choch_bar_idx:]
+        anchor_low_price = float(post_choch_lows.min())
+        anchor_low_date = post_choch_lows.idxmin()
+
+    # Sanity: ensure we have a real move to retrace from
+    move_size = anchor_high_price - anchor_low_price
+    if move_size <= 0 or move_size < float(last_atr) * 2:
+        return None  # Move too small to be meaningful
+
+    # Step 3: failed-ChoCH filter
     last_price = float(close.iloc[-1])
+    if choch.direction == "Bullish":
+        # If price has fallen back below the anchor low, the reversal failed
+        if last_price < anchor_low_price:
+            return None
+    else:
+        # If price has rallied back above the anchor high, the reversal failed
+        if last_price > anchor_high_price:
+            return None
+
+    # Step 4: is current price in the 38.2%–61.8% retracement zone?
+    retracement_pct = _current_retracement_pct(
+        last_price, anchor_low_price, anchor_high_price, choch.direction
+    )
+
+    if not (FIB_ZONE_MIN <= retracement_pct <= FIB_ZONE_MAX):
+        return None
+
+    # We have a setup. Compute Fib levels for the message.
+    fib_prices = {
+        f"{int(r * 1000) / 10}%": _fib_price(
+            anchor_low_price, anchor_high_price, r, choch.direction
+        )
+        for r in FIB_LEVELS
+    }
+
+    # Invalidation level
+    if choch.direction == "Bullish":
+        invalidation = anchor_low_price
+    else:
+        invalidation = anchor_high_price
+
+    # Context indicators
+    rsi14 = rsi(close, length=14)
     pct_change = float((close.iloc[-1] / close.iloc[-2] - 1) * 100) if len(close) >= 2 else 0.0
 
-    broken = result.broken_pivot
+    choch_break_bar_date = str(close.index[choch_bar_idx].date())
+
     return {
         "ticker": ticker,
-        "direction": result.direction,           # "Bullish" or "Bearish"
-        "prior_trend": result.prior_trend,
+        "direction": choch.direction,
+        "prior_trend": choch.prior_trend,
         "price": last_price,
         "pct_change": pct_change,
-        "break_level": float(broken.price) if broken else None,
-        "break_level_date": str(broken.bar_date.date()) if broken else None,
-        "break_strength_atr": round(result.break_strength_atr, 2),
+        "choch_break_level": float(choch.broken_pivot.price),
+        "choch_pivot_date": str(choch.broken_pivot.bar_date.date()),  # date the pivot itself was set
+        "choch_break_date": choch_break_bar_date,                      # date the break happened
+        "choch_bars_ago": choch.bars_ago,
+        "anchor_low": round(anchor_low_price, 2),
+        "anchor_low_date": str(pd.Timestamp(anchor_low_date).date()),
+        "anchor_high": round(anchor_high_price, 2),
+        "anchor_high_date": str(pd.Timestamp(anchor_high_date).date()),
+        "current_retracement_pct": round(retracement_pct * 100, 1),
+        "fib_levels": {k: round(v, 2) for k, v in fib_prices.items()},
+        "invalidation": round(invalidation, 2),
         "rsi": round(float(rsi14.iloc[-1]), 1) if pd.notna(rsi14.iloc[-1]) else None,
         "avg_turnover_cr": round(avg_turnover_cr, 1),
-        "pivot_chain": [asdict(p) | {"bar_date": str(p.bar_date.date())} for p in result.pivot_chain],
     }
 
 
 def scan_watchlist(price_data: dict[str, pd.DataFrame]) -> list[dict[str, Any]]:
-    """
-    Scan all tickers. `price_data` is a dict {ticker: ohlcv_dataframe}, the same
-    shape returned by utils.fetcher.download_bulk.
-    """
+    """Scan all tickers. Returns list of qualifying setups."""
     signals: list[dict[str, Any]] = []
     for ticker, df in price_data.items():
         try:
             sig = scan_one(ticker, df)
             if sig:
                 signals.append(sig)
-                log.info("ChoCH detected: %s %s", ticker, sig["direction"])
+                log.info(
+                    "ChoCH+Fib setup: %s %s @ %.1f%% retracement",
+                    ticker, sig["direction"], sig["current_retracement_pct"],
+                )
         except Exception as e:
-            log.exception("ChoCH scan failed for %s: %s", ticker, e)
+            log.exception("Scan failed for %s: %s", ticker, e)
     return signals
 
 
-def format_telegram_message(signal: dict[str, Any]) -> str:
-    """Visually distinct from the continuation scanner's message format."""
-    direction_emoji = "🟢" if signal["direction"] == "Bullish" else "🔴"
-    arrow = "↗" if signal["direction"] == "Bullish" else "↘"
-    pivot_kind = "high" if signal["direction"] == "Bullish" else "low"
+def format_telegram_message(sig: dict[str, Any]) -> str:
+    """Detailed entry-setup message with Fib levels and invalidation."""
+    direction = sig["direction"]
+    emoji = "🟢" if direction == "Bullish" else "🔴"
+    arrow = "↗" if direction == "Bullish" else "↘"
+    side = "Long" if direction == "Bullish" else "Short"
+
+    fib = sig["fib_levels"]
+    fib_keys = sorted(fib.keys(), key=lambda k: float(k.rstrip("%")))
+
+    # Mark which Fib level is closest to current price
+    cur_pct = sig["current_retracement_pct"]
+    closest_key = min(fib_keys, key=lambda k: abs(float(k.rstrip("%")) - cur_pct))
+
+    fib_lines = []
+    for k in fib_keys:
+        marker = " ← current" if k == closest_key else ""
+        fib_lines.append(f"  • {k} retracement: ₹{fib[k]:.2f}{marker}")
+    fib_block = "\n".join(fib_lines)
+
     return (
-        f"🔄 ChoCH Alert | Daily\n\n"
-        f"{direction_emoji} {signal['ticker']}  |  ₹{signal['price']:.2f} ({signal['pct_change']:+.2f}%)\n"
-        f"🎯 Direction      : {signal['direction']} {arrow} "
-        f"({signal['prior_trend']} → reversal)\n"
-        f"📍 Broke level    : ₹{signal['break_level']:.2f}  "
-        f"(swing {pivot_kind} on {signal['break_level_date']})\n"
-        f"📏 Break strength : {signal['break_strength_atr']}× ATR past level\n"
-        f"📊 RSI Daily      : {signal['rsi']}\n"
-        f"💧 Turnover       : ₹{signal['avg_turnover_cr']} cr/day\n"
-        f"\nFirst reversal signal after a sustained "
-        f"{signal['prior_trend'].lower()}. Watch for follow-through."
+        f"🎯 ChoCH + Fib | {sig['ticker']}\n\n"
+        f"{emoji} Direction      : {direction} {arrow} ({side} setup)\n"
+        f"💰 Current price   : ₹{sig['price']:.2f} ({sig['pct_change']:+.2f}%)\n"
+        f"📍 In Fib zone at  : {cur_pct}% retracement\n\n"
+        f"🔄 ChoCH event     : {sig['choch_bars_ago']} bars ago ({sig['choch_break_date']})\n"
+        f"   Broke ₹{sig['choch_break_level']:.2f} (pivot set {sig['choch_pivot_date']})\n\n"
+        f"📐 Move structure:\n"
+        f"   Low  ₹{sig['anchor_low']:.2f} ({sig['anchor_low_date']})\n"
+        f"   High ₹{sig['anchor_high']:.2f} ({sig['anchor_high_date']})\n\n"
+        f"💡 Fib levels:\n"
+        f"{fib_block}\n\n"
+        f"⛔ Invalidation    : ₹{sig['invalidation']:.2f}\n"
+        f"📊 RSI Daily       : {sig['rsi']}\n"
+        f"💧 Turnover        : ₹{sig['avg_turnover_cr']} cr/day\n"
+        f"\nNot financial advice. Confirm structure on chart."
     )
