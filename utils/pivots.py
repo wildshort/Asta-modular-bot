@@ -44,6 +44,7 @@ class ChochResult:
     break_price: float              # close price that broke the level
     break_strength_atr: float       # how far past the level, in ATR multiples
     pivot_chain: list[Pivot]        # last few pivots, useful for charting/debug
+    bars_ago: int = 0               # how many bars ago the ChoCH closed (0 = today)
 
 
 def find_pivots(
@@ -71,28 +72,24 @@ def find_pivots(
     for i in range(window, len(high) - window):
         win_h = h[i - window : i + window + 1]
         win_l = l[i - window : i + window + 1]
-        # Strict equality on the center is fine; ties on flat tops are rare on daily
-        # and a duplicate pivot at the same price doesn't break the trend logic.
         if h[i] == win_h.max():
             pivots.append(Pivot(index=i, bar_date=idx[i], price=float(h[i]), kind="high"))
         if l[i] == win_l.min():
             pivots.append(Pivot(index=i, bar_date=idx[i], price=float(l[i]), kind="low"))
 
-    # Sort by bar index (a bar can be both a high pivot and low pivot in odd cases;
-    # sort is stable so order among same-index pivots is preserved).
     pivots.sort(key=lambda p: p.index)
     return pivots
 
 
-def classify_trend(pivots: list[Pivot]) -> TrendState:
+def classify_trend_at(pivots: list[Pivot], up_to_bar: int) -> TrendState:
     """
-    Classify trend from the most recent two highs and two lows.
+    Classify trend using only pivots that occurred at or before `up_to_bar`.
 
-    Requires at least 2 highs AND 2 lows in the pivot list. If the pivots
-    are too sparse, returns 'Range' (we don't guess).
+    Used to determine 'what was the prevailing trend before this ChoCH event'.
     """
-    highs = [p for p in pivots if p.kind == "high"]
-    lows = [p for p in pivots if p.kind == "low"]
+    relevant = [p for p in pivots if p.index <= up_to_bar]
+    highs = [p for p in relevant if p.kind == "high"]
+    lows = [p for p in relevant if p.kind == "low"]
 
     if len(highs) < 2 or len(lows) < 2:
         return "Range"
@@ -112,26 +109,24 @@ def classify_trend(pivots: list[Pivot]) -> TrendState:
     return "Range"
 
 
-def detect_choch(
+def find_recent_choch(
     high: pd.Series,
     low: pd.Series,
     close: pd.Series,
     atr_series: pd.Series,
     pivot_window: int = 5,
     atr_multiplier: float = 0.3,
+    lookback_bars: int = 30,
 ) -> ChochResult:
     """
-    Detect a Change-of-Character on the most recent bar.
+    Walk backwards through the last `lookback_bars` to find the most recent
+    bar where a ChoCH event occurred (a close that broke an opposing swing
+    pivot in the prevailing trend's opposite direction).
 
-    Args:
-        high, low, close: OHLC series for one ticker. Must be aligned.
-        atr_series:        ATR series (same length and index as close).
-        pivot_window:      Bars on each side required to confirm a pivot.
-        atr_multiplier:    How far past the swing the close must be, in ATR units.
-                           0.3 = "small but meaningful" — filters tiny wicks.
-
-    Returns ChochResult with direction='None' if no ChoCH is present, or
-    'Bullish'/'Bearish' if the most recent bar broke an opposing pivot.
+    Returns the most recent ChoCH if one exists, else direction="None".
+    Unlike detect_choch (which only checks the last bar), this gives us the
+    structural reversal even if it happened a couple weeks ago — important
+    because the Fib retracement entry doesn't usually happen the same day.
     """
     null_result = ChochResult(
         direction="None",
@@ -140,59 +135,117 @@ def detect_choch(
         break_price=float("nan"),
         break_strength_atr=0.0,
         pivot_chain=[],
+        bars_ago=0,
     )
 
-    if len(close) < 2 * pivot_window + 5:
+    n = len(close)
+    if n < 2 * pivot_window + 5:
         return null_result
 
     pivots = find_pivots(high, low, window=pivot_window)
     if not pivots:
         return null_result
 
-    trend = classify_trend(pivots)
-    last_close = float(close.iloc[-1])
-    last_atr = float(atr_series.iloc[-1]) if pd.notna(atr_series.iloc[-1]) else 0.0
-    if last_atr <= 0:
-        return null_result
+    # Search from most recent bar backwards.
+    start_bar = max(2 * pivot_window, n - lookback_bars)
 
-    threshold = atr_multiplier * last_atr
+    for bar_idx in range(n - 1, start_bar - 1, -1):
+        # Only consider pivots that were CONFIRMED before this bar.
+        # A pivot at index p is confirmed at bar p + pivot_window.
+        confirmed_pivots = [p for p in pivots if p.index + pivot_window <= bar_idx]
+        if len(confirmed_pivots) < 4:
+            continue
 
-    if trend == "Uptrend":
-        # Look for a bearish ChoCH: close below the most recent swing low - k*ATR.
-        recent_lows = [p for p in pivots if p.kind == "low"]
-        if recent_lows:
-            target = recent_lows[-1]
-            if last_close < (target.price - threshold):
-                return ChochResult(
-                    direction="Bearish",
-                    prior_trend=trend,
-                    broken_pivot=target,
-                    break_price=last_close,
-                    break_strength_atr=(target.price - last_close) / last_atr,
-                    pivot_chain=pivots[-6:],
-                )
+        # Trend at this point in time, using only pivots confirmed by then.
+        trend = classify_trend_at(confirmed_pivots, up_to_bar=bar_idx - 1)
+        if trend == "Range":
+            continue
 
-    elif trend == "Downtrend":
-        # Look for a bullish ChoCH: close above the most recent swing high + k*ATR.
-        recent_highs = [p for p in pivots if p.kind == "high"]
-        if recent_highs:
-            target = recent_highs[-1]
-            if last_close > (target.price + threshold):
-                return ChochResult(
-                    direction="Bullish",
-                    prior_trend=trend,
-                    broken_pivot=target,
-                    break_price=last_close,
-                    break_strength_atr=(last_close - target.price) / last_atr,
-                    pivot_chain=pivots[-6:],
-                )
+        bar_close = float(close.iloc[bar_idx])
+        bar_atr = float(atr_series.iloc[bar_idx]) if pd.notna(atr_series.iloc[bar_idx]) else 0.0
+        if bar_atr <= 0:
+            continue
 
-    # Range or no break — return null result with the trend filled in for context.
-    return ChochResult(
-        direction="None",
-        prior_trend=trend,
-        broken_pivot=None,
-        break_price=last_close,
-        break_strength_atr=0.0,
-        pivot_chain=pivots[-6:],
+        threshold = atr_multiplier * bar_atr
+
+        if trend == "Uptrend":
+            # Bearish ChoCH: close below most recent swing low - k*ATR.
+            recent_lows = [p for p in confirmed_pivots if p.kind == "low"]
+            if recent_lows:
+                target = recent_lows[-1]
+                if bar_close < (target.price - threshold):
+                    # Verify this is the FIRST bar in the sequence to break — avoid
+                    # firing repeatedly on every bar after the initial break.
+                    prev_close = float(close.iloc[bar_idx - 1]) if bar_idx > 0 else float("inf")
+                    if prev_close >= (target.price - threshold):
+                        return ChochResult(
+                            direction="Bearish",
+                            prior_trend=trend,
+                            broken_pivot=target,
+                            break_price=bar_close,
+                            break_strength_atr=(target.price - bar_close) / bar_atr,
+                            pivot_chain=confirmed_pivots[-6:],
+                            bars_ago=n - 1 - bar_idx,
+                        )
+
+        elif trend == "Downtrend":
+            # Bullish ChoCH: close above most recent swing high + k*ATR.
+            recent_highs = [p for p in confirmed_pivots if p.kind == "high"]
+            if recent_highs:
+                target = recent_highs[-1]
+                if bar_close > (target.price + threshold):
+                    prev_close = float(close.iloc[bar_idx - 1]) if bar_idx > 0 else float("-inf")
+                    if prev_close <= (target.price + threshold):
+                        return ChochResult(
+                            direction="Bullish",
+                            prior_trend=trend,
+                            broken_pivot=target,
+                            break_price=bar_close,
+                            break_strength_atr=(bar_close - target.price) / bar_atr,
+                            pivot_chain=confirmed_pivots[-6:],
+                            bars_ago=n - 1 - bar_idx,
+                        )
+
+    return null_result
+
+
+def find_anchor_low_before(pivots: list[Pivot], up_to_bar: int) -> Optional[Pivot]:
+    """The lowest swing low at or before `up_to_bar`. Used as Fib anchor for Bullish ChoCH."""
+    relevant_lows = [p for p in pivots if p.kind == "low" and p.index <= up_to_bar]
+    if not relevant_lows:
+        return None
+    return min(relevant_lows, key=lambda p: p.price)
+
+
+def find_anchor_high_before(pivots: list[Pivot], up_to_bar: int) -> Optional[Pivot]:
+    """The highest swing high at or before `up_to_bar`. Used as Fib anchor for Bearish ChoCH."""
+    relevant_highs = [p for p in pivots if p.kind == "high" and p.index <= up_to_bar]
+    if not relevant_highs:
+        return None
+    return max(relevant_highs, key=lambda p: p.price)
+
+
+# Kept for backward compatibility — same as old detect_choch (last-bar only)
+def detect_choch(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    atr_series: pd.Series,
+    pivot_window: int = 5,
+    atr_multiplier: float = 0.3,
+) -> ChochResult:
+    """Detect ChoCH on the most recent bar only. See find_recent_choch for windowed version."""
+    return find_recent_choch(
+        high, low, close, atr_series,
+        pivot_window=pivot_window,
+        atr_multiplier=atr_multiplier,
+        lookback_bars=1,
     )
+
+
+def classify_trend(pivots: list[Pivot]) -> TrendState:
+    """Trend over the entire pivot history. Convenience wrapper."""
+    if not pivots:
+        return "Range"
+    return classify_trend_at(pivots, up_to_bar=pivots[-1].index)
+
