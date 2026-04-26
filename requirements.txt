@@ -1,6 +1,6 @@
-requests
-pandas
-yfinance
-ta
-matplotlib
-scipy
+requests>=2.31
+pandas>=2.0
+numpy>=1.24
+yfinance>=0.2.40
+matplotlib>=3.7
+scipy>=1.10
