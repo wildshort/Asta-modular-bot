@@ -4,7 +4,9 @@ Entry point for the ChoCH trial scanner.
 Run via:
     python choch_main.py
 
-Reads the same TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID env vars as main.py.
+Reads TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID env vars (consumed indirectly
+through alerts.telegram which reads them via config.py).
+
 For the trial, this is meant to be triggered manually via GitHub Actions
 (workflow_dispatch). Cron schedule is intentionally NOT set yet.
 """
@@ -17,11 +19,10 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-# Local imports — assume the same module layout as the rest of the repo.
-# If fetcher exposes a different function name, change this line and ONLY this line.
-from utils.fetcher import fetch_batch  # noqa: F401  -- assumed signature, see notes
-from alerts.telegram import send_message  # noqa: F401  -- assumed function name
-from watchlist.nifty_stocks import NIFTY_STOCKS  # noqa: F401  -- assumed list name
+# --- Imports matched to the actual repo ---
+from utils.fetcher import download_bulk
+from alerts.telegram import send_telegram
+from watchlist.nifty_stocks import watchlist
 
 from scanner.choch_scanner import scan_watchlist, format_telegram_message
 
@@ -61,19 +62,25 @@ def main() -> int:
     if not check_credentials():
         return 1
 
-    tickers = list(NIFTY_STOCKS)
-    log.info("Fetching daily data for %d tickers...", len(tickers))
+    # The watchlist mixes NSE equities (.NS) and commodity futures (=F).
+    # ChoCH on commodities is meaningful too, but for a clean trial keep
+    # only equities — commodity volume/turnover semantics differ.
+    all_symbols = list(watchlist)
+    equity_symbols = [s for s in all_symbols if s.endswith(".NS")]
+    log.info(
+        "Watchlist: %d total, %d equities (filtered for trial)",
+        len(all_symbols),
+        len(equity_symbols),
+    )
 
-    # ---- ASSUMPTION: fetch_batch(tickers, period, interval) -> dict[str, DataFrame]
-    # If your fetcher's signature differs, edit this single call.
-    try:
-        price_data = fetch_batch(tickers, period="1y", interval="1d")
-    except TypeError:
-        # Fallback in case fetcher uses different kwargs
-        log.warning("fetch_batch signature mismatch — trying positional only.")
-        price_data = fetch_batch(tickers)
+    log.info("Fetching daily data for %d tickers...", len(equity_symbols))
+    price_data = download_bulk(equity_symbols, period="1y", interval="1d")
+    log.info("Got data for %d/%d tickers.", len(price_data), len(equity_symbols))
 
-    log.info("Got data for %d/%d tickers.", len(price_data), len(tickers))
+    if not price_data:
+        log.error("No price data returned — aborting.")
+        send_telegram("⚠️ ChoCH trial: no price data returned from fetcher.")
+        return 2
 
     signals = scan_watchlist(price_data)
     log.info("Scan complete. %d ChoCH signals detected.", len(signals))
@@ -84,6 +91,7 @@ def main() -> int:
         json.dump(
             {
                 "run_at": datetime.now().isoformat(),
+                "scanned_count": len(price_data),
                 "signal_count": len(signals),
                 "signals": signals,
             },
@@ -94,19 +102,27 @@ def main() -> int:
     log.info("Wrote results to %s", output_path)
 
     if not signals:
-        # Send a heartbeat so we know the run actually executed.
-        send_message("🔄 ChoCH trial run: 0 signals detected.")
+        # Heartbeat so we know the run actually executed.
+        send_telegram(
+            f"🔄 ChoCH trial run: 0 signals across {len(price_data)} tickers."
+        )
         return 0
 
-    # Send each signal as its own Telegram message — easier to mute/forward individually.
+    # Send each signal as its own Telegram message.
+    sent = 0
     for sig in signals:
         msg = format_telegram_message(sig)
         try:
-            send_message(msg)
-            log.info("Sent: %s %s", sig["ticker"], sig["direction"])
+            ok = send_telegram(msg)
+            if ok:
+                sent += 1
+                log.info("Sent: %s %s", sig["ticker"], sig["direction"])
+            else:
+                log.warning("send_telegram returned False for %s", sig["ticker"])
         except Exception:
             log.exception("Failed to send Telegram message for %s", sig["ticker"])
 
+    log.info("Sent %d/%d signal messages.", sent, len(signals))
     return 0
 
 
