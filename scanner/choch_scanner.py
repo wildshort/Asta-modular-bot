@@ -18,8 +18,8 @@ from utils.indicators import atr, rsi
 from utils.pivots import (
     find_pivots,
     find_recent_choch,
-    find_anchor_low_before,
-    find_anchor_high_before,
+    find_anchor_low_for_bullish_choch,
+    find_anchor_high_for_bearish_choch,
     ChochResult,
     Pivot,
 )
@@ -118,24 +118,27 @@ def scan_one(ticker: str, df: pd.DataFrame) -> Optional[dict[str, Any]]:
 
     if choch.direction == "Bullish":
         # Bullish ChoCH = was downtrend, broke up through swing high.
-        # Anchor low = the structural low BEFORE the ChoCH (the bottom of the downtrend)
-        # Anchor high = the high reached at/after the ChoCH break (peak of the rally so far)
-        anchor_low_pivot = find_anchor_low_before(all_pivots, up_to_bar=choch_bar_idx)
-        if anchor_low_pivot is None:
+        # Anchor low = lowest BAR (not just pivot) within the prior downleg
+        # Anchor high = highest high reached AFTER the ChoCH break (rally peak)
+        anchor_low_result = find_anchor_low_for_bullish_choch(
+            high=high, low=low, pivots=all_pivots, choch_bar=choch_bar_idx,
+        )
+        if anchor_low_result is None:
             return None
-        anchor_low_price = anchor_low_pivot.price
-        anchor_low_date = anchor_low_pivot.bar_date
-        # Highest high from ChoCH bar to current bar is the rally peak
+        anchor_low_price, anchor_low_date = anchor_low_result
+
         post_choch_highs = high.iloc[choch_bar_idx:]
         anchor_high_price = float(post_choch_highs.max())
         anchor_high_date = post_choch_highs.idxmax()
 
     else:  # Bearish
-        anchor_high_pivot = find_anchor_high_before(all_pivots, up_to_bar=choch_bar_idx)
-        if anchor_high_pivot is None:
+        anchor_high_result = find_anchor_high_for_bearish_choch(
+            high=high, low=low, pivots=all_pivots, choch_bar=choch_bar_idx,
+        )
+        if anchor_high_result is None:
             return None
-        anchor_high_price = anchor_high_pivot.price
-        anchor_high_date = anchor_high_pivot.bar_date
+        anchor_high_price, anchor_high_date = anchor_high_result
+
         post_choch_lows = low.iloc[choch_bar_idx:]
         anchor_low_price = float(post_choch_lows.min())
         anchor_low_date = post_choch_lows.idxmin()
