@@ -663,6 +663,171 @@ def _draw_edge_ticks(ax, highs, lows, n, direction):
 # Main entry point
 # ============================================================================
 
+def build_chart_bytes(
+    df: pd.DataFrame,
+    symbol: str,
+    last_price: float,
+    pct_change: float,
+    score: int,
+    direction: str,                 # "bullish" | "bearish" | "neutral"
+    signal_meta: Optional[dict] = None,
+) -> bytes:
+    """
+    Build a curated chart and return PNG bytes (no file on disk).
+
+    Matches the in-memory pattern used by alerts/telegram.py.
+    """
+    import io
+    fig = _build_figure(
+        df=df, symbol=symbol, last_price=last_price, pct_change=pct_change,
+        score=score, direction=direction, signal_meta=signal_meta,
+    )
+    if fig is None:
+        # Fallback for too-little data: still build something
+        return _build_simple_fallback_bytes(df, symbol, last_price, pct_change, score, direction)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+def _build_simple_fallback_bytes(df, symbol, last_price, pct_change, score, direction) -> bytes:
+    import io
+    fig, ax = plt.subplots(figsize=(13, 6))
+    fig.patch.set_facecolor("white")
+    opens = df["Open"].to_numpy(dtype=float)
+    highs = df["High"].to_numpy(dtype=float)
+    lows  = df["Low"].to_numpy(dtype=float)
+    closes = df["Close"].to_numpy(dtype=float)
+    _draw_candles(ax, opens, highs, lows, closes)
+    title_color = "#1b5e20" if direction == "bullish" else "#b71c1c" if direction == "bearish" else "#616161"
+    ax.set_title(
+        f"{symbol}  ₹{last_price:.2f} ({pct_change:+.2f}%)  |  {direction.upper()} "
+        f"(Score {score}/100)  |  Insufficient data for curation",
+        fontsize=12, fontweight="bold", color=title_color, pad=12,
+    )
+    ax.grid(True, alpha=0.2)
+    ax.set_ylabel("Price (₹)", fontsize=10)
+    plt.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+def _build_figure(
+    df: pd.DataFrame,
+    symbol: str,
+    last_price: float,
+    pct_change: float,
+    score: int,
+    direction: str,
+    signal_meta: Optional[dict] = None,
+):
+    """Build the matplotlib figure and return it. Returns None if df is too small."""
+    if signal_meta is None:
+        signal_meta = {}
+
+    required = {"Open", "High", "Low", "Close", "Volume"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"build_chart: missing columns {missing}")
+
+    df = df.copy()
+    if not isinstance(df.index, pd.RangeIndex):
+        df_dates = df.index
+    else:
+        df_dates = pd.date_range(end=pd.Timestamp.today(), periods=len(df), freq="B")
+
+    opens = df["Open"].to_numpy(dtype=float)
+    highs = df["High"].to_numpy(dtype=float)
+    lows  = df["Low"].to_numpy(dtype=float)
+    closes = df["Close"].to_numpy(dtype=float)
+    volumes = df["Volume"].to_numpy(dtype=float)
+    n = len(df)
+
+    if n < 30:
+        return None
+
+    ema5 = _ema(closes, 5)
+    ema50 = _ema(closes, 50) if n >= 50 else _ema(closes, max(5, n // 4))
+
+    regime = _detect_regime(closes, ema50)
+    hero = _select_hero_line(df, regime, direction, signal_meta)
+
+    fig, (ax_p, ax_v) = plt.subplots(
+        2, 1, figsize=(13, 7),
+        gridspec_kw={"height_ratios": [4, 1]}, sharex=True,
+    )
+    fig.patch.set_facecolor("white")
+
+    _draw_candles(ax_p, opens, highs, lows, closes)
+    ax_p.plot(range(n), ema5, color="#5c6bc0", linewidth=0.9, alpha=0.5, label="EMA 5")
+    ax_p.plot(range(n), ema50, color="#ff9800", linewidth=1.2, alpha=0.6, label="EMA 50")
+
+    _draw_hero_line(ax_p, hero, n, closes)
+    _draw_breakout_marker(ax_p, hero, closes, n)
+    _draw_edge_ticks(ax_p, highs, lows, n, direction)
+
+    if hero is None:
+        ax_p.text(
+            0.99, 0.02,
+            "No qualifying trendline (60+ bar span, 3+ touches, alive)",
+            transform=ax_p.transAxes, fontsize=8.5, color="#757575",
+            ha="right", va="bottom", style="italic",
+            bbox=dict(boxstyle="round,pad=0.4", facecolor="#fafafa",
+                      edgecolor="#bdbdbd", linewidth=0.6),
+        )
+
+    breakout_bar = hero["breakout_bar"] if (hero and hero["broken"]) else None
+    _draw_volume(ax_v, opens, closes, volumes, breakout_bar)
+
+    if direction == "bullish":
+        title_color = "#1b5e20"
+        dir_emoji = "📈"
+    elif direction == "bearish":
+        title_color = "#b71c1c"
+        dir_emoji = "📉"
+    else:
+        title_color = "#616161"
+        dir_emoji = "➡"
+
+    suffix = ""
+    if hero and hero["broken"]:
+        if hero["role"] == "resistance":
+            suffix = f"  |  TL BREAKOUT ({hero['span']}-bar resistance)"
+        else:
+            suffix = f"  |  BREAKDOWN ({hero['span']}-bar support)"
+    elif hero and not hero["broken"]:
+        suffix = f"  |  {hero['label']} intact"
+    else:
+        suffix = "  |  No clear structure"
+
+    title = (
+        f"{symbol}  ₹{last_price:.2f} ({pct_change:+.2f}%)  "
+        f"|  {dir_emoji} {direction.upper()} (Score {score}/100){suffix}"
+    )
+    ax_p.set_title(title, fontsize=12, fontweight="bold", color=title_color, pad=12)
+
+    ax_p.legend(loc="upper left", fontsize=9, frameon=False)
+    ax_p.grid(True, alpha=0.2)
+    ax_p.set_ylabel("Price (₹)", fontsize=10)
+    ax_p.set_xlim(-2, n + 8)
+
+    tick_positions = list(range(0, n, max(1, n // 10)))
+    try:
+        tick_labels = [pd.Timestamp(df_dates[i]).strftime("%b %d") for i in tick_positions]
+    except Exception:
+        tick_labels = [str(i) for i in tick_positions]
+    ax_v.set_xticks(tick_positions)
+    ax_v.set_xticklabels(tick_labels, rotation=0, fontsize=8)
+
+    plt.tight_layout()
+    return fig
+
+
 def build_chart(
     df: pd.DataFrame,
     symbol: str,
