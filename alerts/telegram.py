@@ -408,6 +408,12 @@ def send_chart(symbol: str, direction: str = "", score: float = 0.0) -> bool:
 
         log.info(f"[{symbol}] send_chart: built {len(png_bytes)} byte PNG, uploading...")
 
+        # v6: also save chart + diagnostic JSON to scanner/output for artifact upload
+        try:
+            _save_debug_artifacts(symbol, df, direction, png_bytes)
+        except Exception as e:
+            log.warning(f"[{symbol}] debug artifact save failed (non-fatal): {e}")
+
         caption = f"📊 {symbol}  |  {title_suffix}"
         ok = _post_with_retry(
             f"{_API}/bot{TELEGRAM_TOKEN}/sendPhoto",
@@ -424,3 +430,50 @@ def send_chart(symbol: str, direction: str = "", score: float = 0.0) -> bool:
         log.error(f"[{symbol}] ❌ send_chart FAILED: {type(e).__name__}: {e}")
         log.error(traceback.format_exc())
         return False
+
+
+def _save_debug_artifacts(symbol: str, df: pd.DataFrame, direction: str, png_bytes: bytes) -> None:
+    """
+    Save chart PNG and diagnostic JSON to scanner/output/ so they get picked up
+    by the GitHub Actions artifact upload step.
+    """
+    import os
+    import json
+    from utils.chart_builder import diagnose_curation
+
+    safe_symbol = symbol.replace("/", "_").replace(".", "_")
+
+    charts_dir = "scanner/output/charts"
+    diag_dir = "scanner/output/diag"
+    os.makedirs(charts_dir, exist_ok=True)
+    os.makedirs(diag_dir, exist_ok=True)
+
+    # Save chart PNG
+    chart_path = os.path.join(charts_dir, f"{safe_symbol}.png")
+    with open(chart_path, "wb") as f:
+        f.write(png_bytes)
+
+    # Compute and save diagnostic JSON
+    df_norm = _normalize_ohlc_columns(df).copy()
+    direction_lower = direction.lower() if direction else "neutral"
+    if direction_lower not in ("bullish", "bearish", "neutral"):
+        direction_lower = "neutral"
+
+    try:
+        diag = diagnose_curation(
+            df=df_norm,
+            direction=direction_lower,
+            signal_meta={"tl_breakout": direction_lower in ("bullish", "bearish")},
+        )
+    except Exception as e:
+        diag = {"error": f"{type(e).__name__}: {e}"}
+
+    diag["symbol"] = symbol
+    diag["direction_input"] = direction
+    diag["last_price"] = float(df_norm["Close"].iloc[-1]) if len(df_norm) else None
+
+    diag_path = os.path.join(diag_dir, f"{safe_symbol}.json")
+    with open(diag_path, "w") as f:
+        json.dump(diag, f, indent=2, default=str)
+
+    log.info(f"[{symbol}] debug artifacts saved: {chart_path}, {diag_path}")
