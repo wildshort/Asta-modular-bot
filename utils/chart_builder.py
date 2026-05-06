@@ -312,6 +312,15 @@ def _best_horizontal_level(
 # Hero-line selection
 # ============================================================================
 
+def _is_line_relevant(closes, line_y_now: float, atr_recent: float, max_dist_atr: float = 3.0) -> bool:
+    """
+    A line is 'relevant' if its current y-value is within max_dist_atr × ATR
+    of the latest close. Lines drawn through old structure that's now far from
+    price are stale and confusing — filter them out.
+    """
+    return abs(closes[-1] - line_y_now) <= max_dist_atr * atr_recent
+
+
 def _select_hero_line(
     df: pd.DataFrame,
     regime: str,
@@ -321,22 +330,16 @@ def _select_hero_line(
     """
     Decide which line (if any) to draw on this chart, given the regime and signal.
 
-    Returns a dict describing the line to draw, or None.
+    Selection priority:
+      1. FRESH BREAKOUT (within last 3 bars): broken line is the hero.
+      2. CONTINUATION after recent break (3-30 bars ago, price still trending):
+         find a NEW relevant line for the current trend, NOT the old broken one.
+      3. INTACT TREND LINE (rising support / falling resistance): hero if line
+         is currently within range of price.
+      4. None: skip drawing.
 
-    Dict shape:
-      {
-        "kind": "horizontal" | "diagonal",
-        "role": "support" | "resistance",
-        "broken": bool,                     # True if signal is a breakout/breakdown
-        "breakout_bar": int | None,         # index of the breakout bar if any
-        "color": "#hex",
-        "slope": float, "intercept": float, # for diagonal
-        "level": float,                     # for horizontal
-        "touches": list[int],
-        "first_touch": int, "last_touch": int,
-        "span": int,
-        "label": str,                        # legend label
-      }
+    Every candidate must pass the proximity filter — line value at the current
+    bar must be within 3×ATR of close. Otherwise the line is historical noise.
     """
     highs = df["High"].to_numpy()
     lows = df["Low"].to_numpy()
@@ -354,130 +357,113 @@ def _select_hero_line(
     is_bullish = direction == "bullish"
     tl_breakout = bool(signal_meta.get("tl_breakout", False))
 
-    # ---------------- Decision logic ----------------
-    # 1. Bullish breakout signal: prefer the level/line that just broke
+    # ============================================================
+    # 1. FRESH BREAKOUT (within last 3 bars) — bullish reversal/breakout
+    # ============================================================
     if is_bullish and tl_breakout:
-        # Try diagonal descending resistance first (downtrend reversal case)
         diag = _best_diagonal_line(pivot_highs, highs, n, atr_recent)
         if diag and diag["slope"] < 0:
-            breakout_bar = _find_breakout_bar(closes, diag["slope"], diag["intercept"], "above")
+            breakout_bar = _find_breakout_bar(closes, diag["slope"], diag["intercept"], "above", lookback=3)
             if breakout_bar is not None:
-                return {
-                    "kind": "diagonal",
-                    "role": "resistance",
-                    "broken": True,
-                    "breakout_bar": breakout_bar,
-                    "color": "#2e7d32",  # green: bullish-broken resistance
-                    "slope": diag["slope"],
-                    "intercept": diag["intercept"],
-                    "touches": diag["touches"],
-                    "first_touch": diag["first_touch"],
-                    "last_touch": diag["last_touch"],
-                    "span": diag["span"],
-                    "label": f"Resistance broken ({len(diag['touches'])}t, {diag['span']} bars)",
-                }
-        # Fallback: horizontal resistance just broken (range-breakout case)
+                line_now = _line_y(n - 1, diag["slope"], diag["intercept"])
+                if _is_line_relevant(closes, line_now, atr_recent):
+                    return _make_hero("diagonal", "resistance", True, breakout_bar,
+                                      "#2e7d32", diag, atr_recent,
+                                      f"Resistance broken ({len(diag['touches'])}t, {diag['span']} bars)")
         horiz = _best_horizontal_level(pivot_highs, highs, n, atr_recent)
         if horiz:
-            breakout_bar = _find_horizontal_break(closes, horiz["level"], "above")
+            breakout_bar = _find_horizontal_break(closes, horiz["level"], "above", lookback=3)
             if breakout_bar is not None:
-                return {
-                    "kind": "horizontal",
-                    "role": "resistance",
-                    "broken": True,
-                    "breakout_bar": breakout_bar,
-                    "color": "#2e7d32",
-                    "level": horiz["level"],
-                    "touches": horiz["touches"],
-                    "first_touch": horiz["first_touch"],
-                    "last_touch": horiz["last_touch"],
-                    "span": horiz["span"],
-                    "label": f"Resistance broken ({len(horiz['touches'])}t, {horiz['span']} bars)",
-                }
+                if _is_line_relevant(closes, horiz["level"], atr_recent):
+                    return _make_hero_horiz("resistance", True, breakout_bar,
+                                             "#2e7d32", horiz,
+                                             f"Resistance broken ({len(horiz['touches'])}t, {horiz['span']} bars)")
 
-    # 2. Bearish breakdown: support that just broke
+    # ============================================================
+    # 2. FRESH BREAKDOWN (within last 3 bars) — bearish
+    # ============================================================
     if not is_bullish and tl_breakout:
         diag = _best_diagonal_line(pivot_lows, lows, n, atr_recent)
         if diag and diag["slope"] > 0:
-            breakout_bar = _find_breakout_bar(closes, diag["slope"], diag["intercept"], "below")
+            breakout_bar = _find_breakout_bar(closes, diag["slope"], diag["intercept"], "below", lookback=3)
             if breakout_bar is not None:
-                return {
-                    "kind": "diagonal",
-                    "role": "support",
-                    "broken": True,
-                    "breakout_bar": breakout_bar,
-                    "color": "#c62828",  # red: bearish-broken support
-                    "slope": diag["slope"],
-                    "intercept": diag["intercept"],
-                    "touches": diag["touches"],
-                    "first_touch": diag["first_touch"],
-                    "last_touch": diag["last_touch"],
-                    "span": diag["span"],
-                    "label": f"Support broken ({len(diag['touches'])}t, {diag['span']} bars)",
-                }
+                line_now = _line_y(n - 1, diag["slope"], diag["intercept"])
+                if _is_line_relevant(closes, line_now, atr_recent):
+                    return _make_hero("diagonal", "support", True, breakout_bar,
+                                      "#c62828", diag, atr_recent,
+                                      f"Support broken ({len(diag['touches'])}t, {diag['span']} bars)")
         horiz = _best_horizontal_level(pivot_lows, lows, n, atr_recent)
         if horiz:
-            breakout_bar = _find_horizontal_break(closes, horiz["level"], "below")
+            breakout_bar = _find_horizontal_break(closes, horiz["level"], "below", lookback=3)
             if breakout_bar is not None:
-                return {
-                    "kind": "horizontal",
-                    "role": "support",
-                    "broken": True,
-                    "breakout_bar": breakout_bar,
-                    "color": "#c62828",
-                    "level": horiz["level"],
-                    "touches": horiz["touches"],
-                    "first_touch": horiz["first_touch"],
-                    "last_touch": horiz["last_touch"],
-                    "span": horiz["span"],
-                    "label": f"Support broken ({len(horiz['touches'])}t, {horiz['span']} bars)",
-                }
+                if _is_line_relevant(closes, horiz["level"], atr_recent):
+                    return _make_hero_horiz("support", True, breakout_bar,
+                                             "#c62828", horiz,
+                                             f"Support broken ({len(horiz['touches'])}t, {horiz['span']} bars)")
 
-    # 3. Bullish continuation in uptrend: rising support (intact)
-    if is_bullish and regime == "uptrend":
+    # ============================================================
+    # 3. INTACT RISING SUPPORT (bullish) — works in uptrend OR range
+    # This is the IPCALAB fix: don't gate on regime == "uptrend"
+    # ============================================================
+    if is_bullish:
         diag = _best_diagonal_line(pivot_lows, lows, n, atr_recent)
         if diag and diag["slope"] > 0:
-            # Validate: line must be currently below price
             current_line_y = _line_y(n - 1, diag["slope"], diag["intercept"])
-            if closes[-1] > current_line_y:
-                return {
-                    "kind": "diagonal",
-                    "role": "support",
-                    "broken": False,
-                    "breakout_bar": None,
-                    "color": "#2e7d32",  # green: intact bullish support
-                    "slope": diag["slope"],
-                    "intercept": diag["intercept"],
-                    "touches": diag["touches"],
-                    "first_touch": diag["first_touch"],
-                    "last_touch": diag["last_touch"],
-                    "span": diag["span"],
-                    "label": f"Rising support ({len(diag['touches'])}t, {diag['span']} bars)",
-                }
+            # Must be below price AND within proximity (stale-line filter)
+            if closes[-1] > current_line_y and _is_line_relevant(closes, current_line_y, atr_recent):
+                return _make_hero("diagonal", "support", False, None,
+                                  "#2e7d32", diag, atr_recent,
+                                  f"Rising support ({len(diag['touches'])}t, {diag['span']} bars)")
 
-    # 4. Bearish continuation in downtrend: descending resistance (intact)
-    if not is_bullish and regime == "downtrend":
+    # ============================================================
+    # 4. INTACT FALLING RESISTANCE (bearish) — works in downtrend OR range
+    # ============================================================
+    if not is_bullish:
         diag = _best_diagonal_line(pivot_highs, highs, n, atr_recent)
         if diag and diag["slope"] < 0:
             current_line_y = _line_y(n - 1, diag["slope"], diag["intercept"])
-            if closes[-1] < current_line_y:
-                return {
-                    "kind": "diagonal",
-                    "role": "resistance",
-                    "broken": False,
-                    "breakout_bar": None,
-                    "color": "#c62828",  # red: intact bearish resistance
-                    "slope": diag["slope"],
-                    "intercept": diag["intercept"],
-                    "touches": diag["touches"],
-                    "first_touch": diag["first_touch"],
-                    "last_touch": diag["last_touch"],
-                    "span": diag["span"],
-                    "label": f"Falling resistance ({len(diag['touches'])}t, {diag['span']} bars)",
-                }
+            if closes[-1] < current_line_y and _is_line_relevant(closes, current_line_y, atr_recent):
+                return _make_hero("diagonal", "resistance", False, None,
+                                  "#c62828", diag, atr_recent,
+                                  f"Falling resistance ({len(diag['touches'])}t, {diag['span']} bars)")
 
-    # 5. Nothing qualifies: return None -> chart shows no trendline
+    # 5. Nothing qualifies
     return None
+
+
+def _make_hero(kind, role, broken, breakout_bar, color, candidate, atr_recent, label):
+    """Build a hero dict from a diagonal-line candidate."""
+    return {
+        "kind": kind,
+        "role": role,
+        "broken": broken,
+        "breakout_bar": breakout_bar,
+        "color": color,
+        "slope": candidate["slope"],
+        "intercept": candidate["intercept"],
+        "touches": candidate["touches"],
+        "first_touch": candidate["first_touch"],
+        "last_touch": candidate["last_touch"],
+        "span": candidate["span"],
+        "label": label,
+    }
+
+
+def _make_hero_horiz(role, broken, breakout_bar, color, candidate, label):
+    """Build a hero dict from a horizontal-level candidate."""
+    return {
+        "kind": "horizontal",
+        "role": role,
+        "broken": broken,
+        "breakout_bar": breakout_bar,
+        "color": color,
+        "level": candidate["level"],
+        "touches": candidate["touches"],
+        "first_touch": candidate["first_touch"],
+        "last_touch": candidate["last_touch"],
+        "span": candidate["span"],
+        "label": label,
+    }
 
 
 def diagnose_curation(
@@ -609,10 +595,15 @@ def diagnose_curation(
     return out
 
 
-def _find_breakout_bar(closes, slope, intercept, direction: str) -> Optional[int]:
-    """First bar in the last 40 bars where close crosses the line in given direction."""
+def _find_breakout_bar(closes, slope, intercept, direction: str, lookback: int = 3) -> Optional[int]:
+    """First bar in the last `lookback` bars where close crosses the line.
+
+    For monetizable signals, only fresh breakouts (within the last 3 bars by
+    default) should be tagged as 'TL BREAKOUT'. Older breakouts are stale —
+    the move is already gone and subscribers can't act on it.
+    """
     n = len(closes)
-    start = max(1, n - 40)
+    start = max(1, n - lookback)
     for i in range(start, n):
         prev_y = _line_y(i - 1, slope, intercept)
         curr_y = _line_y(i, slope, intercept)
@@ -623,9 +614,36 @@ def _find_breakout_bar(closes, slope, intercept, direction: str) -> Optional[int
     return None
 
 
-def _find_horizontal_break(closes, level, direction: str) -> Optional[int]:
+def _find_horizontal_break(closes, level, direction: str, lookback: int = 3) -> Optional[int]:
+    """First bar in the last `lookback` bars where close crosses the level."""
     n = len(closes)
-    start = max(1, n - 40)
+    start = max(1, n - lookback)
+    for i in range(start, n):
+        if direction == "above" and closes[i] > level and closes[i - 1] <= level:
+            return i
+        if direction == "below" and closes[i] < level and closes[i - 1] >= level:
+            return i
+    return None
+
+
+def _was_recently_broken(closes, slope, intercept, direction: str, lookback: int = 30) -> Optional[int]:
+    """Find a *historical* break within the last `lookback` bars (used to detect
+    stocks that broke out a while ago and are now in continuation mode)."""
+    n = len(closes)
+    start = max(1, n - lookback)
+    for i in range(start, n):
+        prev_y = _line_y(i - 1, slope, intercept)
+        curr_y = _line_y(i, slope, intercept)
+        if direction == "above" and closes[i] > curr_y and closes[i - 1] <= prev_y:
+            return i
+        if direction == "below" and closes[i] < curr_y and closes[i - 1] >= prev_y:
+            return i
+    return None
+
+
+def _was_recently_broken_horiz(closes, level, direction: str, lookback: int = 30) -> Optional[int]:
+    n = len(closes)
+    start = max(1, n - lookback)
     for i in range(start, n):
         if direction == "above" and closes[i] > level and closes[i - 1] <= level:
             return i
