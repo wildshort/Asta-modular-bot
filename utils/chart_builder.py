@@ -480,6 +480,135 @@ def _select_hero_line(
     return None
 
 
+def diagnose_curation(
+    df: pd.DataFrame,
+    direction: str,
+    signal_meta: Optional[dict] = None,
+) -> dict:
+    """
+    Run the same selection logic as _select_hero_line but return a dict
+    explaining what was found, what was considered, and what was chosen.
+
+    Useful for debugging why a chart shows "No clear structure".
+    """
+    if signal_meta is None:
+        signal_meta = {}
+
+    out: dict = {
+        "n_bars": len(df),
+        "direction": direction,
+        "tl_breakout_input": bool(signal_meta.get("tl_breakout", False)),
+    }
+
+    if len(df) < 30:
+        out["error"] = "insufficient_bars"
+        return out
+
+    highs = df["High"].to_numpy(dtype=float)
+    lows = df["Low"].to_numpy(dtype=float)
+    closes = df["Close"].to_numpy(dtype=float)
+    n = len(df)
+
+    # Indicators / regime
+    ema50 = _ema(closes, 50) if n >= 50 else _ema(closes, max(5, n // 4))
+    regime = _detect_regime(closes, ema50)
+    out["regime"] = regime
+
+    atr_arr = _atr(highs, lows, closes, period=14)
+    atr_recent = float(np.nanmean(atr_arr[-20:])) if n >= 20 else float(np.nanmean(atr_arr))
+    if not np.isfinite(atr_recent) or atr_recent <= 0:
+        atr_recent = float(np.std(closes[-20:])) if n >= 20 else 1.0
+    out["atr_recent"] = round(atr_recent, 4)
+    out["touch_tolerance_used"] = round(atr_recent * 0.6, 4)
+
+    # Pivot counts
+    pivot_highs = _find_pivots(highs, lookback=5, kind="high")
+    pivot_lows = _find_pivots(lows, lookback=5, kind="low")
+    out["pivot_highs_count"] = len(pivot_highs)
+    out["pivot_lows_count"] = len(pivot_lows)
+    out["pivot_highs_indices"] = [int(x) for x in pivot_highs[-10:]]  # last 10 only
+    out["pivot_lows_indices"] = [int(x) for x in pivot_lows[-10:]]
+
+    # Best candidate lines (for inspection)
+    best_diag_high = _best_diagonal_line(pivot_highs, highs, n, atr_recent)
+    best_diag_low = _best_diagonal_line(pivot_lows, lows, n, atr_recent)
+    best_horiz_high = _best_horizontal_level(pivot_highs, highs, n, atr_recent)
+    best_horiz_low = _best_horizontal_level(pivot_lows, lows, n, atr_recent)
+
+    def _summarize_diag(d, kind):
+        if d is None:
+            return {"found": False}
+        return {
+            "found": True,
+            "kind": kind,
+            "slope": round(d["slope"], 4),
+            "span": d["span"],
+            "touches_count": len(d["touches"]),
+            "first_touch_bar": d["first_touch"],
+            "last_touch_bar": d["last_touch"],
+            "score": round(d["score"], 2),
+        }
+
+    def _summarize_horiz(h):
+        if h is None:
+            return {"found": False}
+        return {
+            "found": True,
+            "kind": "horizontal",
+            "level": round(h["level"], 2),
+            "span": h["span"],
+            "touches_count": len(h["touches"]),
+            "first_touch_bar": h["first_touch"],
+            "last_touch_bar": h["last_touch"],
+            "score": round(h["score"], 2),
+        }
+
+    out["best_diagonal_resistance"] = _summarize_diag(best_diag_high, "diag_high")
+    out["best_diagonal_support"] = _summarize_diag(best_diag_low, "diag_low")
+    out["best_horizontal_resistance"] = _summarize_horiz(best_horiz_high)
+    out["best_horizontal_support"] = _summarize_horiz(best_horiz_low)
+
+    # Run actual selection
+    hero = _select_hero_line(df, regime, direction, signal_meta)
+    if hero is None:
+        out["chosen"] = None
+        out["chosen_reason"] = "no_qualifying_line"
+        # Explain why each candidate was rejected
+        rejection_reasons = []
+        for name, candidate in [
+            ("diag_resistance", best_diag_high),
+            ("diag_support", best_diag_low),
+            ("horiz_resistance", best_horiz_high),
+            ("horiz_support", best_horiz_low),
+        ]:
+            if candidate is None:
+                rejection_reasons.append(f"{name}: none qualifying (span/touches/recency)")
+            else:
+                # Check why it wasn't selected even though it qualified individually
+                if name.startswith("diag_resistance") and candidate["slope"] >= 0:
+                    rejection_reasons.append(f"{name}: slope not negative ({candidate['slope']:.4f})")
+                elif name.startswith("diag_support") and candidate["slope"] <= 0:
+                    rejection_reasons.append(f"{name}: slope not positive ({candidate['slope']:.4f})")
+                else:
+                    rejection_reasons.append(
+                        f"{name}: candidate exists but not selected for direction={direction} regime={regime}"
+                    )
+        out["rejection_reasons"] = rejection_reasons
+    else:
+        out["chosen"] = {
+            "kind": hero["kind"],
+            "role": hero["role"],
+            "broken": hero["broken"],
+            "breakout_bar": hero["breakout_bar"],
+            "span": hero["span"],
+            "touches_count": len(hero["touches"]),
+            "color": hero["color"],
+            "label": hero["label"],
+        }
+
+    return out
+
+
 def _find_breakout_bar(closes, slope, intercept, direction: str) -> Optional[int]:
     """First bar in the last 40 bars where close crosses the line in given direction."""
     n = len(closes)
