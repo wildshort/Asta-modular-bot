@@ -1,19 +1,17 @@
 """
 Telegram delivery + charting.
 
-v5.2 changes:
+v6 changes:
+  - Chart-building delegated to utils/chart_builder.py (curation-first design).
+  - Old v5.2 chart code kept as `_build_chart_v1` for instant rollback.
+  - To revert: in send_chart(), change `_build_chart` to `_build_chart_v1`.
+
+v5.2 (kept for backward compat / fallback):
   - FIX: Correctly handle yfinance MultiIndex in BOTH orderings
     (ticker-first from group_by='ticker' AND field-first).
-    Previous v5.1 only handled one direction — real yfinance output with
-    group_by='ticker' was still broken.
   - Isolated trendline computation in a try/except so a bug there can never
-    block a chart being sent. If trendline logic fails, chart renders with
-    just Donchian channel + indicators.
-  - Explicit loud logging of any chart-send failure so workflow logs show
-    exactly what went wrong.
-
-Everything v4 does (regression-validated trendlines, ATR-scaled tolerance,
-Donchian overlay, key level detection) is still here — just hardened.
+    block a chart being sent.
+  - Explicit loud logging of any chart-send failure.
 """
 from __future__ import annotations
 
@@ -42,12 +40,15 @@ from config import CHAT_ID, TELEGRAM_TOKEN
 from utils.fetcher import download_single
 from utils.indicators import bollinger, macd as macd_calc, rsi as rsi_calc, atr as atr_calc
 
+# v6: new curated chart builder
+from utils.chart_builder import build_chart_bytes as _curated_build_chart_bytes
+
 log = logging.getLogger(__name__)
 
 CHART_PERIOD = "1y"
 _API = "https://api.telegram.org"
 
-# trendline tuning
+# v5.2 trendline tuning (still used by _build_chart_v1 fallback)
 _PIVOT_ORDER         = 5
 _MIN_TOUCHES         = 3
 _TOUCH_TOLERANCE_ATR = 0.5
@@ -91,7 +92,65 @@ def send_telegram(message: str) -> bool:
     return ok
 
 
-# ---------- pivot helpers ----------
+def _normalize_ohlc_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    yfinance can return MultiIndex columns in two formats depending on group_by:
+      - ('Close', 'SIEMENS.NS')  — field first, ticker second
+      - ('SIEMENS.NS', 'Close')  — ticker first, field second  (group_by='ticker')
+    """
+    if not isinstance(df.columns, pd.MultiIndex):
+        return df
+    ohlc_fields = {"Open", "High", "Low", "Close", "Volume", "Adj Close"}
+    for level in range(df.columns.nlevels):
+        level_vals = set(df.columns.get_level_values(level))
+        if level_vals & ohlc_fields:
+            df = df.copy()
+            df.columns = df.columns.get_level_values(level)
+            return df
+    df = df.copy()
+    df.columns = df.columns.get_level_values(0)
+    return df
+
+
+# ============================================================
+# v6 chart builder (delegates to utils/chart_builder.py)
+# ============================================================
+def _build_chart(symbol: str, df: pd.DataFrame, direction: str, score: float) -> bytes:
+    """
+    v6 chart builder: curation-first.
+    Delegates to utils.chart_builder.build_chart_bytes.
+    """
+    df = _normalize_ohlc_columns(df).copy()
+
+    last = float(df["Close"].iloc[-1])
+    prev = float(df["Close"].iloc[-2]) if len(df) >= 2 else last
+    pct = (last - prev) / prev * 100 if prev else 0.0
+
+    direction_lower = direction.lower() if direction else "neutral"
+    if direction_lower not in ("bullish", "bearish", "neutral"):
+        direction_lower = "neutral"
+
+    # Detect TL breakout signal heuristically: caller passes direction,
+    # we let the curator figure out if a breakout actually occurred.
+    # This preserves the existing send_chart signature.
+    signal_meta = {
+        "tl_breakout": True if direction_lower in ("bullish", "bearish") else False,
+    }
+
+    return _curated_build_chart_bytes(
+        df=df,
+        symbol=symbol,
+        last_price=last,
+        pct_change=pct,
+        score=int(score),
+        direction=direction_lower,
+        signal_meta=signal_meta,
+    )
+
+
+# ============================================================
+# v5.2 chart builder (kept as backup — call instead of _build_chart to revert)
+# ============================================================
 def _find_pivots(values: np.ndarray, kind: str, order: int = _PIVOT_ORDER) -> np.ndarray:
     if _HAS_SCIPY:
         cmp = np.greater if kind == "high" else np.less
@@ -105,19 +164,12 @@ def _find_pivots(values: np.ndarray, kind: str, order: int = _PIVOT_ORDER) -> np
     return np.array(out, dtype=int)
 
 
-def _fit_trendline(
-    pivot_idx: np.ndarray,
-    pivot_val: np.ndarray,
-    kind: str,
-    atr_val: float,
-) -> Optional[dict]:
+def _fit_trendline(pivot_idx, pivot_val, kind, atr_val):
     n = len(pivot_idx)
     if n < _MIN_TOUCHES or atr_val <= 0:
         return None
-
     best = None
     tol = _TOUCH_TOLERANCE_ATR * atr_val
-
     for a in range(n - 1):
         for b in range(a + 1, n):
             x1, y1 = float(pivot_idx[a]), float(pivot_val[a])
@@ -125,29 +177,23 @@ def _fit_trendline(
             if x2 == x1:
                 continue
             slope = (y2 - y1) / (x2 - x1)
-
-            # slope sanity checks
             if kind == "high" and slope > atr_val * 0.1:
                 continue
             if kind == "low" and slope < -atr_val * 0.1:
                 continue
-
             line_vals = y1 + slope * (pivot_idx.astype(float) - x1)
             dists = np.abs(pivot_val.astype(float) - line_vals)
             touches = int((dists <= tol).sum())
             if touches < _MIN_TOUCHES:
                 continue
-
             if kind == "high":
                 if ((pivot_val.astype(float) - line_vals) > tol).any():
                     continue
             else:
                 if ((line_vals - pivot_val.astype(float)) > tol).any():
                     continue
-
             mean_dist = float(np.mean(dists[dists <= tol]))
             score = touches - (mean_dist / tol) * 0.5
-
             if best is None or score > best["score"]:
                 best = {
                     "slope": float(slope),
@@ -160,7 +206,7 @@ def _fit_trendline(
     return best
 
 
-def _key_horizontal_level(pivot_val: np.ndarray, atr_val: float) -> Optional[float]:
+def _key_horizontal_level(pivot_val, atr_val):
     if len(pivot_val) < 3 or atr_val <= 0:
         return None
     pivot_val = pivot_val.astype(float)
@@ -172,67 +218,31 @@ def _key_horizontal_level(pivot_val: np.ndarray, atr_val: float) -> Optional[flo
     return counts[0][1]
 
 
-def _compute_trendlines_safe(df: pd.DataFrame, symbol: str) -> tuple[list[dict], str]:
-    """Wrapper that never raises. Returns empty list on any failure."""
+def _compute_trendlines_safe(df, symbol):
     try:
         return _compute_trendlines_inner(df, symbol)
     except Exception as e:
-        log.warning(f"[{symbol}] trendline calc failed ({type(e).__name__}: {e}); chart will skip trendlines")
-        log.debug(traceback.format_exc())
+        log.warning(f"[{symbol}] v1 trendline calc failed: {e}")
         return [], "Watching"
 
 
-def _normalize_ohlc_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    yfinance can return MultiIndex columns in two formats depending on group_by:
-      - ('Close', 'SIEMENS.NS')  — field first, ticker second
-      - ('SIEMENS.NS', 'Close')  — ticker first, field second  (group_by='ticker')
-    Detect which level has OHLC field names and flatten to that.
-    """
-    if not isinstance(df.columns, pd.MultiIndex):
-        return df
-    ohlc_fields = {"Open", "High", "Low", "Close", "Volume", "Adj Close"}
-    for level in range(df.columns.nlevels):
-        level_vals = set(df.columns.get_level_values(level))
-        if level_vals & ohlc_fields:
-            df = df.copy()
-            df.columns = df.columns.get_level_values(level)
-            return df
-    # Fallback
-    df = df.copy()
-    df.columns = df.columns.get_level_values(0)
-    return df
-
-
-def _compute_trendlines_inner(df: pd.DataFrame, symbol: str) -> tuple[list[dict], str]:
+def _compute_trendlines_inner(df, symbol):
     df = _normalize_ohlc_columns(df).copy().reset_index(drop=True)
     n = len(df)
     if n < 30:
         return [], "Watching"
-
     lookback_start = max(0, n - _LOOKBACK_BARS)
     high_vals = df["High"].astype(float).values
     low_vals  = df["Low"].astype(float).values
-
     high_piv_rel = _find_pivots(high_vals[lookback_start:], "high")
     low_piv_rel  = _find_pivots(low_vals[lookback_start:],  "low")
     high_piv = (np.asarray(high_piv_rel) + lookback_start).astype(int)
     low_piv  = (np.asarray(low_piv_rel)  + lookback_start).astype(int)
-
     atr_series = atr_calc(df["High"], df["Low"], df["Close"])
     atr_val = float(atr_series.iloc[-1]) if pd.notna(atr_series.iloc[-1]) else 0.0
-
-    log.info(
-        f"[{symbol}] pivots in last {_LOOKBACK_BARS} bars: "
-        f"{len(high_piv)} highs / {len(low_piv)} lows, ATR={atr_val:.2f}"
-    )
-
-    lines: list[dict] = []
-    status = "Watching"
+    lines, status = [], "Watching"
     last_idx = n - 1
     last_close = float(df["Close"].iloc[-1])
-
-    # Resistance
     if len(high_piv) >= _MIN_TOUCHES:
         pvals = high_vals[high_piv]
         res = _fit_trendline(high_piv, pvals, "high", atr_val)
@@ -240,17 +250,12 @@ def _compute_trendlines_inner(df: pd.DataFrame, symbol: str) -> tuple[list[dict]
             y_now   = res["intercept"] + res["slope"] * last_idx
             y_start = res["intercept"] + res["slope"] * res["start_idx"]
             lines.append({
-                "x": [res["start_idx"], last_idx],
-                "y": [y_start, y_now],
-                "color": "#D32F2F",
-                "label": f"Resistance ({res['touches']}t)",
-                "style": "-",
-                "lw": 2.0,
+                "x": [res["start_idx"], last_idx], "y": [y_start, y_now],
+                "color": "#D32F2F", "label": f"Resistance ({res['touches']}t)",
+                "style": "-", "lw": 2.0,
             })
             if last_close > y_now + _TOUCH_TOLERANCE_ATR * atr_val:
                 status = "🚀 TL BREAKOUT"
-
-    # Support
     if len(low_piv) >= _MIN_TOUCHES:
         pvals = low_vals[low_piv]
         sup = _fit_trendline(low_piv, pvals, "low", atr_val)
@@ -258,17 +263,12 @@ def _compute_trendlines_inner(df: pd.DataFrame, symbol: str) -> tuple[list[dict]
             y_now   = sup["intercept"] + sup["slope"] * last_idx
             y_start = sup["intercept"] + sup["slope"] * sup["start_idx"]
             lines.append({
-                "x": [sup["start_idx"], last_idx],
-                "y": [y_start, y_now],
-                "color": "#2E7D32",
-                "label": f"Support ({sup['touches']}t)",
-                "style": "-",
-                "lw": 2.0,
+                "x": [sup["start_idx"], last_idx], "y": [y_start, y_now],
+                "color": "#2E7D32", "label": f"Support ({sup['touches']}t)",
+                "style": "-", "lw": 2.0,
             })
             if last_close < y_now - _TOUCH_TOLERANCE_ATR * atr_val:
                 status = "🔻 TL BREAKDOWN"
-
-    # Key level
     if len(high_piv) or len(low_piv):
         all_piv_val = np.concatenate([
             high_vals[high_piv] if len(high_piv) else np.array([]),
@@ -280,15 +280,10 @@ def _compute_trendlines_inner(df: pd.DataFrame, symbol: str) -> tuple[list[dict]
             if not too_close:
                 start_idx = max(0, n - _LOOKBACK_BARS)
                 lines.append({
-                    "x": [start_idx, last_idx],
-                    "y": [kl, kl],
-                    "color": "#FFA000",
-                    "label": f"Key ₹{kl:.0f}",
-                    "style": ":",
-                    "lw": 1.8,
+                    "x": [start_idx, last_idx], "y": [kl, kl],
+                    "color": "#FFA000", "label": f"Key ₹{kl:.0f}",
+                    "style": ":", "lw": 1.8,
                 })
-
-    # Donchian — always drawn
     if n >= _DONCHIAN_LEN + 1:
         recent = df.iloc[-(_DONCHIAN_LEN + 1):-1]
         dc_high = float(recent["High"].max())
@@ -309,12 +304,11 @@ def _compute_trendlines_inner(df: pd.DataFrame, symbol: str) -> tuple[list[dict]
                 status = "🚀 20D BREAKOUT"
             elif last_close < dc_low:
                 status = "🔻 20D BREAKDOWN"
-
     return lines, status
 
 
-# ---------- chart ----------
-def _build_chart(symbol: str, df: pd.DataFrame, title_suffix: str, title_color: str) -> bytes:
+def _build_chart_v1(symbol: str, df: pd.DataFrame, title_suffix: str, title_color: str) -> bytes:
+    """v5.2 chart builder — kept for rollback. Uses 3 panels (price/RSI/MACD)."""
     df = _normalize_ohlc_columns(df).copy()
     df["EMA_50"] = df["Close"].ewm(span=50, adjust=False).mean()
     df["EMA_5"]  = df["Close"].ewm(span=5,  adjust=False).mean()
@@ -324,14 +318,11 @@ def _build_chart(symbol: str, df: pd.DataFrame, title_suffix: str, title_color: 
     df["MACD"], df["Signal"], df["Hist"] = m_line, s_line, h
 
     trend_lines, tl_status = _compute_trendlines_safe(df, symbol)
-    log.info(f"[{symbol}] drawing {len(trend_lines)} lines, status={tl_status}")
-
     df_plot = df.reset_index()
     date_col = df_plot.columns[0]
 
     fig = plt.figure(figsize=(16, 10), facecolor="white")
     gs = gridspec.GridSpec(3, 1, height_ratios=[3, 1, 1])
-
     ax1 = plt.subplot(gs[0])
     x = df_plot.index
     up = df_plot[df_plot.Close >= df_plot.Open]
@@ -340,22 +331,15 @@ def _build_chart(symbol: str, df: pd.DataFrame, title_suffix: str, title_color: 
     ax1.vlines(up.index, up.Low, up.High, color="#089981", linewidth=0.8)
     ax1.bar(down.index, down.Close - down.Open, width=0.7, bottom=down.Open, color="#F23645")
     ax1.vlines(down.index, down.Low, down.High, color="#F23645", linewidth=0.8)
-
     ax1.plot(x, df_plot["EMA_5"],  color="#2962FF", lw=1.0, label="EMA 5",  alpha=0.75)
     ax1.plot(x, df_plot["EMA_50"], color="#FF9800", lw=1.5, label="EMA 50")
     ax1.plot(x, df_plot["BB_Upper"], color="blue", lw=0.5, alpha=0.4)
     ax1.plot(x, df_plot["BB_Lower"], color="blue", lw=0.5, alpha=0.4)
     ax1.fill_between(x, df_plot["BB_Upper"], df_plot["BB_Lower"], color="blue", alpha=0.05)
-
     for line in trend_lines:
-        ax1.plot(line["x"], line["y"],
-                 color=line["color"],
-                 linestyle=line.get("style", "-"),
-                 lw=line.get("lw", 2.0),
-                 alpha=line.get("alpha", 1.0),
-                 label=line["label"],
-                 zorder=5)
-
+        ax1.plot(line["x"], line["y"], color=line["color"],
+                 linestyle=line.get("style", "-"), lw=line.get("lw", 2.0),
+                 alpha=line.get("alpha", 1.0), label=line["label"], zorder=5)
     last = float(df["Close"].iloc[-1])
     prev = float(df["Close"].iloc[-2])
     pct = (last - prev) / prev * 100 if prev else 0.0
@@ -365,7 +349,6 @@ def _build_chart(symbol: str, df: pd.DataFrame, title_suffix: str, title_color: 
     ax1.set_title(title, fontsize=14, fontweight="bold", color=title_color, pad=12)
     ax1.grid(True, color="#f0f0f0")
     ax1.legend(loc="upper left", frameon=False, fontsize=9)
-
     ax2 = plt.subplot(gs[1], sharex=ax1)
     ax2.plot(x, df_plot["RSI"], color="#7E57C2")
     ax2.axhline(70, color="red",   ls="--", lw=0.8)
@@ -374,7 +357,6 @@ def _build_chart(symbol: str, df: pd.DataFrame, title_suffix: str, title_color: 
     ax2.set_ylabel("RSI", fontweight="bold")
     ax2.set_ylim(0, 100)
     ax2.grid(True, color="#f0f0f0")
-
     ax3 = plt.subplot(gs[2], sharex=ax1)
     ax3.plot(x, df_plot["MACD"],   color="#2962FF", label="MACD")
     ax3.plot(x, df_plot["Signal"], color="#FF9800", label="Signal")
@@ -384,13 +366,11 @@ def _build_chart(symbol: str, df: pd.DataFrame, title_suffix: str, title_color: 
     ax3.set_ylabel("MACD", fontweight="bold")
     ax3.grid(True, color="#f0f0f0")
     ax3.legend(loc="upper left", frameon=False, fontsize=8)
-
     step = max(1, len(df_plot) // 10)
     ax3.set_xticks(x[::step])
     ax3.set_xticklabels(df_plot[date_col].dt.strftime("%b %d")[::step], rotation=0)
     plt.setp([ax.get_xticklabels() for ax in [ax1, ax2]], visible=False)
     plt.subplots_adjust(left=0.06, right=0.97, top=0.94, bottom=0.06, hspace=0.08)
-
     buf = io.BytesIO()
     plt.savefig(buf, format="png", bbox_inches="tight", dpi=120)
     plt.close(fig)
@@ -398,6 +378,9 @@ def _build_chart(symbol: str, df: pd.DataFrame, title_suffix: str, title_color: 
     return buf.read()
 
 
+# ============================================================
+# Top-level send_chart
+# ============================================================
 def send_chart(symbol: str, direction: str = "", score: float = 0.0) -> bool:
     if not TELEGRAM_TOKEN or not CHAT_ID:
         log.warning(f"[{symbol}] send_chart: missing Telegram creds, skipping")
@@ -413,15 +396,16 @@ def send_chart(symbol: str, direction: str = "", score: float = 0.0) -> bool:
 
         if direction == "Bullish":
             title_suffix = f"📈 BULLISH (Score {score:.0f}/100)"
-            title_color = "green"
         elif direction == "Bearish":
             title_suffix = f"📉 BEARISH (Score {score:.0f}/100)"
-            title_color = "red"
         else:
             title_suffix = "Analysis"
-            title_color = "black"
 
-        png_bytes = _build_chart(symbol, df, title_suffix, title_color)
+        # v6: curated chart (delegates to chart_builder)
+        # To revert to v5.2 in an emergency, replace the next line with:
+        #   png_bytes = _build_chart_v1(symbol, df, title_suffix, "green" if direction=="Bullish" else "red" if direction=="Bearish" else "black")
+        png_bytes = _build_chart(symbol, df, direction, score)
+
         log.info(f"[{symbol}] send_chart: built {len(png_bytes)} byte PNG, uploading...")
 
         caption = f"📊 {symbol}  |  {title_suffix}"
@@ -440,4 +424,3 @@ def send_chart(symbol: str, direction: str = "", score: float = 0.0) -> bool:
         log.error(f"[{symbol}] ❌ send_chart FAILED: {type(e).__name__}: {e}")
         log.error(traceback.format_exc())
         return False
-
