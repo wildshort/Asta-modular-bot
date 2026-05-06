@@ -37,41 +37,39 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ✅ FIXED: Telegram secrets now passed via env so the scanner can read them.
-      # ✅ FIXED: Calls main.py (credentials check + better logging) instead of running stock_scanner.py directly.
       - name: Run scanner
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           mkdir -p scanner/output
-          python main.py
+          python scanner/stock_scanner.py
 
-      - name: Show results in Summary
+      - name: Run quality check
         if: always()
         run: |
+          python scanner/quality_check.py || true
+
+      # ✅ NEW: write results into the Run Summary so I can read them directly
+      - name: Show results in Summary
+        run: |
           echo "## 📊 Scan Results" >> $GITHUB_STEP_SUMMARY
-          if [ -f scanner/output/latest.json ]; then
+          if [ -f scanner/output/latest.txt ]; then
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat scanner/output/latest.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          elif [ -f scanner/output/latest.json ]; then
             echo '```json' >> $GITHUB_STEP_SUMMARY
             cat scanner/output/latest.json >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
           else
-            echo "_No output file found. See logs below._" >> $GITHUB_STEP_SUMMARY
-          fi
-          if [ -d logs ]; then
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### Log tail" >> $GITHUB_STEP_SUMMARY
+            echo "_No output files found in scanner/output/ (printing last 120 log lines)_" >> $GITHUB_STEP_SUMMARY
+            echo '' >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
-            tail -n 80 logs/*.log 2>/dev/null || echo "No logs captured."
+            tail -n 120 "$GITHUB_WORKSPACE"/* 2>/dev/null || echo "No extra logs captured."
             echo '```' >> $GITHUB_STEP_SUMMARY
           fi
 
       - name: Upload scan artifact
-        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: scan-results
-          path: |
-            scanner/output/*
-            logs/*
+          path: scanner/output/*
           if-no-files-found: warn
