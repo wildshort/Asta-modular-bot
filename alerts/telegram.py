@@ -381,7 +381,7 @@ def _build_chart_v1(symbol: str, df: pd.DataFrame, title_suffix: str, title_colo
 # ============================================================
 # Top-level send_chart
 # ============================================================
-def _classify_chart(df: pd.DataFrame, direction: str) -> dict:
+def classify_chart(df: pd.DataFrame, direction: str) -> dict:
     """
     Classify what kind of setup the chart represents. Returns one of:
       - 'fresh_breakout' / 'fresh_breakdown'  → send to Telegram
@@ -507,7 +507,7 @@ def send_chart(symbol: str, direction: str = "", score: float = 0.0) -> bool:
 
         # Classify the chart and decide whether to send to Telegram
         df_norm = _normalize_ohlc_columns(df).copy()
-        classification = _classify_chart(df_norm, direction)
+        classification = classify_chart(df_norm, direction)
         category = classification.get("category", "unknown")
 
         log.info(f"[{symbol}] classified as: {category} ({classification.get('reason', '')})")
@@ -592,7 +592,7 @@ def _save_debug_artifacts(symbol: str, df: pd.DataFrame, direction: str, png_byt
 
     # Add classification (what category this chart fell into)
     try:
-        classification = _classify_chart(df_norm, direction)
+        classification = classify_chart(df_norm, direction)
         diag["classification"] = classification
         diag["sent_to_telegram"] = classification.get("category") in {
             "fresh_breakout", "fresh_breakdown", "pullback"
