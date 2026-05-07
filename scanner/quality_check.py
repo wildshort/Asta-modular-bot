@@ -143,6 +143,10 @@ def main() -> int:
 
     all_issues: list[dict] = []
     issues_by_type: dict[str, int] = {}
+    classification_counts: dict[str, int] = {}
+    sent_count = 0
+    skipped_count = 0
+    by_category: dict[str, list[str]] = {}
 
     for diag_file in diag_files:
         try:
@@ -151,6 +155,17 @@ def main() -> int:
         except Exception as e:
             print(f"  ! failed to read {diag_file.name}: {e}")
             continue
+
+        # Track classification stats
+        cls = diag.get("classification", {})
+        category = cls.get("category", "unknown")
+        classification_counts[category] = classification_counts.get(category, 0) + 1
+        by_category.setdefault(category, []).append(diag.get("symbol", "?"))
+
+        if diag.get("sent_to_telegram"):
+            sent_count += 1
+        else:
+            skipped_count += 1
 
         issues = check_one(diag)
         for issue in issues:
@@ -165,6 +180,10 @@ def main() -> int:
     report = {
         "summary": {
             "total_charts": len(diag_files),
+            "sent_to_telegram": sent_count,
+            "skipped_telegram": skipped_count,
+            "classification_counts": classification_counts,
+            "by_category_symbols": by_category,
             "issues_found": len(all_issues),
             "issues_by_type": issues_by_type,
             "by_severity": {
@@ -181,7 +200,10 @@ def main() -> int:
 
     print("\n=== Quality Check Summary ===")
     print(f"Total charts: {len(diag_files)}")
-    print(f"Issues found: {len(all_issues)}")
+    print(f"  Sent to Telegram: {sent_count}")
+    print(f"  Skipped: {skipped_count}")
+    print(f"  Classifications: {classification_counts}")
+    print(f"\nIssues found: {len(all_issues)}")
     print(f"By severity: high={report['summary']['by_severity']['high']}, "
           f"medium={report['summary']['by_severity']['medium']}, "
           f"low={report['summary']['by_severity']['low']}")
