@@ -314,11 +314,24 @@ def _best_horizontal_level(
 
 def _is_line_relevant(closes, line_y_now: float, atr_recent: float, max_dist_atr: float = 3.0) -> bool:
     """
-    A line is 'relevant' if its current y-value is within max_dist_atr × ATR
-    of the latest close. Lines drawn through old structure that's now far from
-    price are stale and confusing — filter them out.
+    Strict proximity check used for *broken* lines (where we want the broken
+    level to be near current price). For intact rising support / falling
+    resistance lines, use _is_line_fresh instead — those can be far below/above
+    price legitimately when a stock has trended hard.
     """
     return abs(closes[-1] - line_y_now) <= max_dist_atr * atr_recent
+
+
+def _is_line_fresh(candidate: dict, n_bars: int, max_bars_since_touch: int = 30) -> bool:
+    """
+    A diagonal line is 'fresh' if its last touch is recent. This is the right
+    staleness check for intact trendlines — proximity to current price doesn't
+    matter (price can be far from the line in a strong trend), but recency of
+    respect does.
+    """
+    last_touch = candidate.get("last_touch", 0)
+    bars_since = (n_bars - 1) - last_touch
+    return bars_since <= max_bars_since_touch
 
 
 def _select_hero_line(
@@ -331,15 +344,13 @@ def _select_hero_line(
     Decide which line (if any) to draw on this chart, given the regime and signal.
 
     Selection priority:
-      1. FRESH BREAKOUT (within last 3 bars): broken line is the hero.
-      2. CONTINUATION after recent break (3-30 bars ago, price still trending):
-         find a NEW relevant line for the current trend, NOT the old broken one.
-      3. INTACT TREND LINE (rising support / falling resistance): hero if line
-         is currently within range of price.
+      1. FRESH BREAKOUT (within last 3 bars): broken line is the hero, must be
+         within 3×ATR of price (strict proximity for broken levels).
+      2. INTACT RISING SUPPORT (bullish): green line below price, last touch
+         within 30 bars (freshness, not proximity).
+      3. INTACT FALLING RESISTANCE (bearish): red line above price, last touch
+         within 30 bars.
       4. None: skip drawing.
-
-    Every candidate must pass the proximity filter — line value at the current
-    bar must be within 3×ATR of close. Otherwise the line is historical noise.
     """
     highs = df["High"].to_numpy()
     lows = df["Low"].to_numpy()
@@ -403,14 +414,15 @@ def _select_hero_line(
 
     # ============================================================
     # 3. INTACT RISING SUPPORT (bullish) — works in uptrend OR range
-    # This is the IPCALAB fix: don't gate on regime == "uptrend"
+    # Filter by FRESHNESS (last touch recent), not proximity. A strong
+    # trend can leave price far above the line — that's fine, the line
+    # is still where pullbacks would test.
     # ============================================================
     if is_bullish:
         diag = _best_diagonal_line(pivot_lows, lows, n, atr_recent)
         if diag and diag["slope"] > 0:
             current_line_y = _line_y(n - 1, diag["slope"], diag["intercept"])
-            # Must be below price AND within proximity (stale-line filter)
-            if closes[-1] > current_line_y and _is_line_relevant(closes, current_line_y, atr_recent):
+            if closes[-1] > current_line_y and _is_line_fresh(diag, n):
                 return _make_hero("diagonal", "support", False, None,
                                   "#2e7d32", diag, atr_recent,
                                   f"Rising support ({len(diag['touches'])}t, {diag['span']} bars)")
@@ -422,7 +434,7 @@ def _select_hero_line(
         diag = _best_diagonal_line(pivot_highs, highs, n, atr_recent)
         if diag and diag["slope"] < 0:
             current_line_y = _line_y(n - 1, diag["slope"], diag["intercept"])
-            if closes[-1] < current_line_y and _is_line_relevant(closes, current_line_y, atr_recent):
+            if closes[-1] < current_line_y and _is_line_fresh(diag, n):
                 return _make_hero("diagonal", "resistance", False, None,
                                   "#c62828", diag, atr_recent,
                                   f"Falling resistance ({len(diag['touches'])}t, {diag['span']} bars)")
