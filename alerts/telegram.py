@@ -381,6 +381,100 @@ def _build_chart_v1(symbol: str, df: pd.DataFrame, title_suffix: str, title_colo
 # ============================================================
 # Top-level send_chart
 # ============================================================
+def _classify_chart(df: pd.DataFrame, direction: str) -> dict:
+    """
+    Classify what kind of setup the chart represents. Returns one of:
+      - 'fresh_breakout' / 'fresh_breakdown'  → send to Telegram
+      - 'pullback'                            → send to Telegram
+      - 'continuation'                        → skip Telegram (still saved to artifact)
+      - 'no_structure'                        → skip Telegram
+
+    A pullback = intact line where price is currently within 1.5×ATR of the
+    line value. The line is acting as a current floor/ceiling for price.
+
+    A continuation = intact line but price is floating well above/below it
+    (>1.5×ATR away). The line is real but not a current decision point.
+    """
+    from utils.chart_builder import diagnose_curation
+
+    direction_lower = direction.lower() if direction else "neutral"
+    if direction_lower not in ("bullish", "bearish", "neutral"):
+        direction_lower = "neutral"
+
+    try:
+        diag = diagnose_curation(
+            df=df,
+            direction=direction_lower,
+            signal_meta={"tl_breakout": direction_lower in ("bullish", "bearish")},
+        )
+    except Exception as e:
+        return {"category": "no_structure", "reason": f"diag_failed: {e}"}
+
+    chosen = diag.get("chosen")
+
+    if chosen is None:
+        return {"category": "no_structure", "reason": "no qualifying line"}
+
+    # Fresh breakout/breakdown — already filtered by chart_builder to last 3 bars
+    if chosen.get("broken"):
+        if chosen.get("role") == "resistance":
+            return {"category": "fresh_breakout", "reason": "resistance broken in last 3 bars"}
+        else:
+            return {"category": "fresh_breakdown", "reason": "support broken in last 3 bars"}
+
+    # Intact line — distinguish pullback from continuation by proximity
+    closes = df["Close"].to_numpy(dtype=float)
+    last_close = float(closes[-1])
+    atr_recent = diag.get("atr_recent", 1.0) or 1.0
+
+    # Compute current line value
+    if chosen.get("kind") == "diagonal":
+        # We need slope+intercept; chosen dict from diagnose_curation has them under
+        # the candidate keys. Reconstruct from the originating candidate.
+        candidate_key = (
+            "best_diagonal_support" if chosen.get("role") == "support"
+            else "best_diagonal_resistance"
+        )
+        cand = diag.get(candidate_key, {})
+        slope = cand.get("slope")
+        # Need intercept — derive from first_touch
+        first_touch = chosen.get("first_touch")
+        if slope is None or first_touch is None:
+            return {"category": "continuation", "reason": "could not compute line value"}
+        # We don't have intercept stored, reconstruct via touches
+        # Use the last_touch_bar from the candidate to get a known point
+        last_touch_bar = cand.get("last_touch_bar")
+        if last_touch_bar is None:
+            return {"category": "continuation", "reason": "no last_touch reference"}
+        # We need actual y-value at last_touch — pull from price data
+        if chosen.get("role") == "support":
+            y_at_last_touch = float(df["Low"].iloc[last_touch_bar])
+        else:
+            y_at_last_touch = float(df["High"].iloc[last_touch_bar])
+        n = len(df)
+        line_y_now = y_at_last_touch + slope * ((n - 1) - last_touch_bar)
+    else:
+        # Horizontal
+        line_y_now = chosen.get("level", last_close)
+
+    distance = abs(last_close - line_y_now)
+    atr_dist = distance / atr_recent if atr_recent > 0 else 999
+
+    PULLBACK_THRESHOLD_ATR = 1.5
+    if atr_dist <= PULLBACK_THRESHOLD_ATR:
+        return {
+            "category": "pullback",
+            "reason": f"price within {atr_dist:.2f}×ATR of {chosen.get('role')} line",
+            "distance_atr": round(atr_dist, 2),
+        }
+    else:
+        return {
+            "category": "continuation",
+            "reason": f"price {atr_dist:.2f}×ATR away from line — not a current test",
+            "distance_atr": round(atr_dist, 2),
+        }
+
+
 def send_chart(symbol: str, direction: str = "", score: float = 0.0) -> bool:
     if not TELEGRAM_TOKEN or not CHAT_ID:
         log.warning(f"[{symbol}] send_chart: missing Telegram creds, skipping")
@@ -401,27 +495,51 @@ def send_chart(symbol: str, direction: str = "", score: float = 0.0) -> bool:
         else:
             title_suffix = "Analysis"
 
-        # v6: curated chart (delegates to chart_builder)
-        # To revert to v5.2 in an emergency, replace the next line with:
-        #   png_bytes = _build_chart_v1(symbol, df, title_suffix, "green" if direction=="Bullish" else "red" if direction=="Bearish" else "black")
+        # Build chart (always — needed for both Telegram and artifact)
         png_bytes = _build_chart(symbol, df, direction, score)
+        log.info(f"[{symbol}] send_chart: built {len(png_bytes)} byte PNG")
 
-        log.info(f"[{symbol}] send_chart: built {len(png_bytes)} byte PNG, uploading...")
-
-        # v6: also save chart + diagnostic JSON to scanner/output for artifact upload
+        # Always save debug artifacts (full record of every signal)
         try:
             _save_debug_artifacts(symbol, df, direction, png_bytes)
         except Exception as e:
             log.warning(f"[{symbol}] debug artifact save failed (non-fatal): {e}")
 
+        # Classify the chart and decide whether to send to Telegram
+        df_norm = _normalize_ohlc_columns(df).copy()
+        classification = _classify_chart(df_norm, direction)
+        category = classification.get("category", "unknown")
+
+        log.info(f"[{symbol}] classified as: {category} ({classification.get('reason', '')})")
+
+        # Only send fresh breakouts/breakdowns and pullbacks to Telegram
+        SEND_CATEGORIES = {"fresh_breakout", "fresh_breakdown", "pullback"}
+        if category not in SEND_CATEGORIES:
+            log.info(f"[{symbol}] ⏸  skipping Telegram send (category={category})")
+            return True  # not an error — intentional skip
+
+        # Build caption that reflects the category
+        if category == "fresh_breakout":
+            cat_label = "🚀 FRESH BREAKOUT"
+        elif category == "fresh_breakdown":
+            cat_label = "🔻 FRESH BREAKDOWN"
+        elif category == "pullback":
+            cat_label = "🎯 PULLBACK"
+        else:
+            cat_label = ""
+
         caption = f"📊 {symbol}  |  {title_suffix}"
+        if cat_label:
+            caption = f"{cat_label}\n{caption}"
+
+        log.info(f"[{symbol}] send_chart: uploading to Telegram...")
         ok = _post_with_retry(
             f"{_API}/bot{TELEGRAM_TOKEN}/sendPhoto",
             files={"photo": ("chart.png", png_bytes, "image/png")},
             data={"chat_id": CHAT_ID, "caption": caption},
         )
         if ok:
-            log.info(f"[{symbol}] ✅ Chart sent successfully")
+            log.info(f"[{symbol}] ✅ Chart sent successfully ({category})")
         else:
             log.error(f"[{symbol}] ❌ Telegram sendPhoto failed after retries")
         return ok
@@ -471,6 +589,17 @@ def _save_debug_artifacts(symbol: str, df: pd.DataFrame, direction: str, png_byt
     diag["symbol"] = symbol
     diag["direction_input"] = direction
     diag["last_price"] = float(df_norm["Close"].iloc[-1]) if len(df_norm) else None
+
+    # Add classification (what category this chart fell into)
+    try:
+        classification = _classify_chart(df_norm, direction)
+        diag["classification"] = classification
+        diag["sent_to_telegram"] = classification.get("category") in {
+            "fresh_breakout", "fresh_breakdown", "pullback"
+        }
+    except Exception as e:
+        diag["classification"] = {"category": "unknown", "error": str(e)}
+        diag["sent_to_telegram"] = False
 
     diag_path = os.path.join(diag_dir, f"{safe_symbol}.json")
     with open(diag_path, "w") as f:
