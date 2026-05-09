@@ -13,6 +13,10 @@ Key changes vs old code:
   8. BATCH DOWNLOAD: one API call per timeframe, not one per symbol.
   9. PER-SYMBOL REJECTION LOGGING: tells you *why* a stock didn't qualify,
      so you can tune intelligently.
+ 10. CLASSIFICATION FILTER: text + chart alerts only fire when the chart
+     classifies as a fresh breakout, fresh breakdown, or pullback. Trend
+     continuation and no-structure cases are still scored and saved to the
+     summary JSON, but no Telegram alerts are sent.
 """
 from __future__ import annotations
 
@@ -25,7 +29,7 @@ from typing import Optional
 
 import pandas as pd
 
-from alerts.telegram import send_telegram, send_chart
+from alerts.telegram import send_telegram, send_chart, classify_chart
 from config import (
     COMMODITY_SUFFIXES,
     MIN_ADX,
@@ -53,6 +57,10 @@ from utils.indicators import (
 
 log = logging.getLogger(__name__)
 
+# Categories that warrant a Telegram alert (text + chart). Everything else is
+# saved to the artifact summary but not sent.
+ALERT_CATEGORIES = {"fresh_breakout", "fresh_breakdown", "pullback"}
+
 
 # ------------------ DATA CONTAINER ------------------
 @dataclass
@@ -77,24 +85,15 @@ class SignalResult:
     divergence: str = ""
     turnover_cr: float = 0.0  # in crores
 
+    # Classification (set after analysis if signal qualifies)
+    classification: str = ""        # 'fresh_breakout' | 'pullback' | 'continuation' | 'no_structure'
+    classification_reason: str = ""
+
 
 # ------------------ SCORING ENGINE ------------------
 #
 # Each criterion contributes up to N points toward the direction score.
 # A stock must clear SIGNAL_MIN_SCORE (default 70) to fire an alert.
-#
-# Weights reflect how reliable each signal is in isolation:
-#   Weekly trend alignment   : 20  (the single most important filter)
-#   Daily MACD cross         : 15
-#   RSI range correctness    : 15
-#   BB breakout              : 10
-#   Trend breakout           : 10
-#   Volume spike             : 10
-#   EMA 5/50 crossover       : 10
-#   ADX strength             : 10
-#   RSI divergence (bonus)   : +10 (can push a 70 to 80)
-#
-# Total achievable: 100 (+10 divergence bonus = 110, capped at 100)
 
 def _score_bullish(
     rsi_d: float, rsi_w: float, macd_d: str, macd_w: str,
@@ -104,7 +103,6 @@ def _score_bullish(
     score = 0.0
     reasons: list[str] = []
 
-    # Weekly trend alignment (most important)
     if macd_w == "PCO" and rsi_w > 50:
         score += 20
         reasons.append("Weekly uptrend confirmed")
@@ -112,46 +110,38 @@ def _score_bullish(
         score += 10
         reasons.append("Weekly MACD positive")
 
-    # Daily MACD
     if macd_d == "PCO":
         score += 15
         reasons.append("Daily MACD bullish")
 
-    # RSI in healthy bullish zone (not overbought yet)
     if 55 <= rsi_d <= 75:
         score += 15
         reasons.append(f"RSI in bull zone ({rsi_d:.0f})")
     elif 50 <= rsi_d < 55:
         score += 8
 
-    # BB upper challenge
     if bb == "Upper":
         score += 10
         reasons.append("BB upper challenge")
 
-    # Donchian breakout
     if trend == "Bullish":
         score += 10
         reasons.append("20-bar breakout")
 
-    # Volume confirmation
     if vol_ok:
         score += 10
         reasons.append("Volume spike")
 
-    # EMA crossover
     if ema_bull:
         score += 10
         reasons.append("EMA 5/50 bullish cross")
 
-    # Trend strength
     if adx_v >= 25:
         score += 10
         reasons.append(f"Strong trend (ADX {adx_v:.0f})")
     elif adx_v >= MIN_ADX:
         score += 5
 
-    # Divergence bonus
     if divergence == "Bullish":
         score += 10
         reasons.append("Bullish RSI divergence")
@@ -219,7 +209,6 @@ def _analyze(
     daily: pd.DataFrame,
     weekly: pd.DataFrame,
 ) -> SignalResult:
-    # Require enough history
     if daily is None or len(daily) < 60:
         return SignalResult(symbol, 0.0, "None", 0.0, rejection="Insufficient daily history")
     if weekly is None or len(weekly) < 30:
@@ -233,7 +222,6 @@ def _analyze(
 
     last_price = float(close_d.iloc[-1])
 
-    # ---- Liquidity filter (skip dust stocks) ----
     is_commodity = symbol.endswith(COMMODITY_SUFFIXES)
     turnover = avg_turnover_inr(close_d, vol_d)
     if not is_commodity and turnover < MIN_AVG_TURNOVER_INR:
@@ -243,7 +231,6 @@ def _analyze(
             turnover_cr=turnover / 1e7,
         )
 
-    # ---- Daily indicators ----
     rsi_d_series = rsi(close_d)
     rsi_d = float(rsi_d_series.iloc[-1])
     macd_d_line, macd_d_sig, _ = macd(close_d)
@@ -264,12 +251,10 @@ def _analyze(
 
     divergence = rsi_divergence(close_d, rsi_d_series)
 
-    # ---- Weekly indicators ----
     rsi_w = float(rsi(close_w).iloc[-1])
     macd_w_line, macd_w_sig, _ = macd(close_w)
     macd_w_state, _ = macd_cross(macd_w_line, macd_w_sig)
 
-    # ---- Trend strength gate (hard filter before scoring) ----
     if adx_v < MIN_ADX:
         return SignalResult(
             symbol, last_price, "None", 0.0,
@@ -278,7 +263,6 @@ def _analyze(
             turnover_cr=turnover / 1e7,
         )
 
-    # ---- Score both directions ----
     bull_score, bull_reasons = _score_bullish(
         rsi_d, rsi_w, macd_d_state, macd_w_state,
         bb_pos_val, trend, vol_ok, ema_bull, adx_v, divergence,
@@ -323,8 +307,18 @@ def _analyze(
 # ------------------ FORMATTING ------------------
 def _format_alert(r: SignalResult) -> str:
     emoji = "📈" if r.direction == "Bullish" else "📉"
+    # Prefix the alert text with the classification banner
+    if r.classification == "fresh_breakout":
+        banner = "🚀 FRESH BREAKOUT\n"
+    elif r.classification == "fresh_breakdown":
+        banner = "🔻 FRESH BREAKDOWN\n"
+    elif r.classification == "pullback":
+        banner = "🎯 PULLBACK\n"
+    else:
+        banner = ""
+
     lines = [
-        f"{emoji} {r.symbol}  |  Score: {r.score:.0f}/100",
+        f"{banner}{emoji} {r.symbol}  |  Score: {r.score:.0f}/100",
         f"    💰 Price       : ₹{r.price:.2f}",
         f"    🎯 Direction   : {r.direction}",
         f"    📊 RSI D/W     : {r.rsi_daily:.1f} / {r.rsi_weekly:.1f}",
@@ -341,15 +335,32 @@ def _format_alert(r: SignalResult) -> str:
     return "\n".join(lines)
 
 
+# ------------------ CLASSIFICATION HELPER ------------------
+def _classify_signal(result: SignalResult, daily: pd.DataFrame) -> SignalResult:
+    """
+    Run the chart classifier on the daily DataFrame and attach the result
+    to the SignalResult. This decides whether the signal warrants a Telegram
+    alert (fresh breakout/breakdown/pullback) or just a summary entry.
+    """
+    try:
+        classification = classify_chart(daily, result.direction)
+        result.classification = classification.get("category", "unknown")
+        result.classification_reason = classification.get("reason", "")
+    except Exception as e:
+        result.classification = "error"
+        result.classification_reason = f"{type(e).__name__}: {e}"
+        log.warning(f"[{result.symbol}] classification failed: {e}")
+    return result
+
+
 # ------------------ MAIN ENTRY POINT ------------------
 def run_stock_scan(symbols: list[str], send_alerts: bool = False) -> dict:
     """
-    Scan all symbols, score them, send alerts for qualifying ones.
-    Returns a summary dict.
+    Scan all symbols, score them, classify them, send alerts only for
+    fresh breakouts / breakdowns / pullbacks.
     """
     log.info(f"Starting scan of {len(symbols)} symbols...")
 
-    # ---- Bulk download both timeframes ----
     log.info("Downloading daily data (bulk)...")
     daily_data = download_bulk(symbols, period="6mo", interval="1d")
     log.info(f"  got {len(daily_data)}/{len(symbols)} symbols")
@@ -358,7 +369,6 @@ def run_stock_scan(symbols: list[str], send_alerts: bool = False) -> dict:
     weekly_data = download_bulk(symbols, period="2y", interval="1wk")
     log.info(f"  got {len(weekly_data)}/{len(symbols)} symbols")
 
-    # ---- Analyze each symbol ----
     bullish: list[SignalResult] = []
     bearish: list[SignalResult] = []
     rejected: list[SignalResult] = []
@@ -374,11 +384,20 @@ def run_stock_scan(symbols: list[str], send_alerts: bool = False) -> dict:
             result = _analyze(sym, d, w)
 
             if result.direction == "Bullish":
+                # Classify before adding so we can decide later
+                result = _classify_signal(result, d)
                 bullish.append(result)
-                log.info(f"🟢 {sym} BULLISH score={result.score:.0f} [{', '.join(result.reasons)}]")
+                log.info(
+                    f"🟢 {sym} BULLISH score={result.score:.0f} "
+                    f"class={result.classification} [{', '.join(result.reasons)}]"
+                )
             elif result.direction == "Bearish":
+                result = _classify_signal(result, d)
                 bearish.append(result)
-                log.info(f"🔴 {sym} BEARISH score={result.score:.0f} [{', '.join(result.reasons)}]")
+                log.info(
+                    f"🔴 {sym} BEARISH score={result.score:.0f} "
+                    f"class={result.classification} [{', '.join(result.reasons)}]"
+                )
             else:
                 rejected.append(result)
                 log.debug(f"⚪ {sym} rejected: {result.rejection}")
@@ -386,48 +405,89 @@ def run_stock_scan(symbols: list[str], send_alerts: bool = False) -> dict:
         except Exception as e:
             log.error(f"{sym} analysis failed: {e}", exc_info=True)
 
-    # ---- Sort by score (strongest first) ----
     bullish.sort(key=lambda r: r.score, reverse=True)
     bearish.sort(key=lambda r: r.score, reverse=True)
 
     log.info(f"Scan complete: {len(bullish)} bullish, {len(bearish)} bearish, {len(rejected)} rejected")
 
-    # ---- Apply cooldown, then alert ----
+    # ---- Apply cooldown ----
     state = load_state()
     fresh_bullish = [r for r in bullish if should_alert(state, r.symbol, "Bullish", r.score)]
     fresh_bearish = [r for r in bearish if should_alert(state, r.symbol, "Bearish", r.score)]
-
     log.info(f"After cooldown: {len(fresh_bullish)} new bullish, {len(fresh_bearish)} new bearish")
 
+    # ---- Apply classification filter (only breakouts / breakdowns / pullbacks alert) ----
+    # ---- Plus: BB challenge filter — bullish must have BB Upper, bearish must have BB Lower
+    def _passes_bb_filter(r: SignalResult) -> bool:
+        if r.direction == "Bullish":
+            return r.bb_pos == "Upper"
+        if r.direction == "Bearish":
+            return r.bb_pos == "Lower"
+        return False
+
+    alert_bullish = [
+        r for r in fresh_bullish
+        if r.classification in ALERT_CATEGORIES and _passes_bb_filter(r)
+    ]
+    alert_bearish = [
+        r for r in fresh_bearish
+        if r.classification in ALERT_CATEGORIES and _passes_bb_filter(r)
+    ]
+
+    # Build the skipped lists with reasons (for logging)
+    skipped_bullish = []
+    for r in fresh_bullish:
+        if r.classification not in ALERT_CATEGORIES:
+            r.classification_reason = f"not actionable ({r.classification})"
+            skipped_bullish.append(r)
+        elif not _passes_bb_filter(r):
+            r.classification_reason = f"BB not Upper (got {r.bb_pos})"
+            skipped_bullish.append(r)
+    skipped_bearish = []
+    for r in fresh_bearish:
+        if r.classification not in ALERT_CATEGORIES:
+            r.classification_reason = f"not actionable ({r.classification})"
+            skipped_bearish.append(r)
+        elif not _passes_bb_filter(r):
+            r.classification_reason = f"BB not Lower (got {r.bb_pos})"
+            skipped_bearish.append(r)
+
+    log.info(
+        f"After classification + BB filter: {len(alert_bullish)} bullish alerts "
+        f"({len(skipped_bullish)} skipped), {len(alert_bearish)} bearish alerts "
+        f"({len(skipped_bearish)} skipped)"
+    )
+    for r in skipped_bullish + skipped_bearish:
+        log.info(f"  ⏸  {r.symbol} skipped ({r.classification_reason})")
+
     if send_alerts:
-        if fresh_bullish:
-            header = f"📈 BULLISH SIGNALS ({len(fresh_bullish)})\n" + "=" * 35
+        if alert_bullish:
+            header = f"📈 BULLISH SIGNALS ({len(alert_bullish)})\n" + "=" * 35
             send_telegram(header)
             time.sleep(TELEGRAM_MSG_DELAY_SEC)
-            for r in fresh_bullish:
+            for r in alert_bullish:
                 send_telegram(_format_alert(r))
                 time.sleep(TELEGRAM_MSG_DELAY_SEC)
                 send_chart(r.symbol, direction=r.direction, score=r.score)
                 time.sleep(TELEGRAM_MSG_DELAY_SEC)
                 record_alert(state, r.symbol, "Bullish", r.score)
 
-        if fresh_bearish:
-            header = f"📉 BEARISH SIGNALS ({len(fresh_bearish)})\n" + "=" * 35
+        if alert_bearish:
+            header = f"📉 BEARISH SIGNALS ({len(alert_bearish)})\n" + "=" * 35
             send_telegram(header)
             time.sleep(TELEGRAM_MSG_DELAY_SEC)
-            for r in fresh_bearish:
+            for r in alert_bearish:
                 send_telegram(_format_alert(r))
                 time.sleep(TELEGRAM_MSG_DELAY_SEC)
                 send_chart(r.symbol, direction=r.direction, score=r.score)
                 time.sleep(TELEGRAM_MSG_DELAY_SEC)
                 record_alert(state, r.symbol, "Bearish", r.score)
 
-        if not fresh_bullish and not fresh_bearish:
-            log.info("No new signals to send after cooldown filter.")
+        if not alert_bullish and not alert_bearish:
+            log.info("No new tradable signals (breakouts / breakdowns / pullbacks) to send.")
 
         save_state(state)
     else:
-        # Still print to console even when alerts disabled
         for r in bullish:
             print(_format_alert(r))
         for r in bearish:
@@ -439,17 +499,41 @@ def run_stock_scan(symbols: list[str], send_alerts: bool = False) -> dict:
         summary = {
             "scanned": len(symbols),
             "bullish": [
-                {"symbol": r.symbol, "score": r.score, "reasons": r.reasons}
+                {
+                    "symbol": r.symbol,
+                    "score": r.score,
+                    "classification": r.classification,
+                    "bb_pos": r.bb_pos,
+                    "alerted": (
+                        r.classification in ALERT_CATEGORIES
+                        and ((r.direction == "Bullish" and r.bb_pos == "Upper")
+                             or (r.direction == "Bearish" and r.bb_pos == "Lower"))
+                    ),
+                    "reasons": r.reasons,
+                }
                 for r in bullish
             ],
             "bearish": [
-                {"symbol": r.symbol, "score": r.score, "reasons": r.reasons}
+                {
+                    "symbol": r.symbol,
+                    "score": r.score,
+                    "classification": r.classification,
+                    "bb_pos": r.bb_pos,
+                    "alerted": (
+                        r.classification in ALERT_CATEGORIES
+                        and ((r.direction == "Bullish" and r.bb_pos == "Upper")
+                             or (r.direction == "Bearish" and r.bb_pos == "Lower"))
+                    ),
+                    "reasons": r.reasons,
+                }
                 for r in bearish
             ],
             "counts": {
                 "bullish": len(bullish),
                 "bearish": len(bearish),
                 "rejected": len(rejected),
+                "alerted_bullish": len(alert_bullish) if send_alerts else 0,
+                "alerted_bearish": len(alert_bearish) if send_alerts else 0,
             },
         }
         with open("scanner/output/latest.json", "w") as f:

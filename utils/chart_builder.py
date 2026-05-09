@@ -1,0 +1,1146 @@
+"""
+utils/chart_builder.py
+======================
+
+Curated chart builder for the Asta modular bot scanner.
+
+Replaces the old chart-drawing code with a curation-first approach:
+
+- Detects trend regime (uptrend / downtrend / range)
+- Picks ONE hero trendline aligned with the regime
+- Validates the label contextually (support must be below price, etc.)
+- Constrains line extension (no infinite projections into empty space)
+- Marks breakouts/breakdowns visually with vertical bands and annotations
+- Falls back gracefully to "no line drawn" if no qualifying line exists
+- Uses volume panel (with breakout bar highlighted) instead of MACD overlay
+
+Hero-line selection rules:
+
+  Regime      | Signal type          | Hero line
+  ------------|----------------------|------------------------------------------
+  Uptrend     | Bullish breakout     | Horizontal resistance just broken
+  Uptrend     | Bullish continuation | Rising support trendline through pivots
+  Downtrend   | Bullish reversal     | Descending resistance trendline broken
+  Downtrend   | Bearish continuation | Descending resistance still intact
+  Range       | Bullish breakout     | Horizontal range top (just broken)
+  Range       | Bearish breakdown    | Horizontal range bottom (just broken)
+  Any         | (no qualifying line) | Skip; show only EMAs + 20D edge ticks
+
+Color convention:
+  - Green bold line: bullish-relevant level (rising support, broken resistance
+    in a bullish reversal/breakout)
+  - Red bold line: bearish-relevant level (broken support in breakdown,
+    intact descending resistance in downtrend)
+
+Usage from main.py:
+
+    from utils.chart_builder import build_chart
+
+    chart_path = build_chart(
+        df=ohlcv_dataframe,           # DataFrame with OHLCV columns
+        symbol="EXIDEIND.NS",
+        last_price=363.45,
+        pct_change=2.02,
+        score=70,
+        direction="bullish",          # "bullish" | "bearish" | "neutral"
+        signal_meta={                  # optional: extra info to display
+            "rsi_d": 72.6,
+            "rsi_w": 69.3,
+            "adx": 30.6,
+            "vol_ratio": 0.6,
+            "tl_breakout": True,        # True if a TL breakout fired
+            "twentyD_breakout": True,
+        },
+        out_dir="/tmp",                # where to save the PNG
+    )
+
+Returns the absolute path to the saved PNG file.
+
+Assumptions:
+- df has columns: 'Open', 'High', 'Low', 'Close', 'Volume'
+- df is sorted oldest -> newest, datetime index
+- Latest bar is df.iloc[-1] and is a CLOSED bar (intraday-bar handling
+  should be done upstream per existing convention)
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.patches import Rectangle, FancyArrowPatch
+
+# -- Indicator math: import from existing utils.indicators where possible.
+# We provide local fallbacks so this module is portable if imports change.
+try:
+    from utils.indicators import ema as _ema_external  # type: ignore
+    _HAS_EXTERNAL_EMA = True
+except Exception:
+    _HAS_EXTERNAL_EMA = False
+
+try:
+    from utils.indicators import atr as _atr_external  # type: ignore
+    _HAS_EXTERNAL_ATR = True
+except Exception:
+    _HAS_EXTERNAL_ATR = False
+
+
+# ============================================================================
+# Math helpers (with fallbacks)
+# ============================================================================
+
+def _ema(arr: np.ndarray, period: int) -> np.ndarray:
+    if _HAS_EXTERNAL_EMA:
+        try:
+            return np.asarray(_ema_external(pd.Series(arr), period))
+        except Exception:
+            pass
+    alpha = 2.0 / (period + 1)
+    out = np.empty_like(arr, dtype=float)
+    out[0] = arr[0]
+    for i in range(1, len(arr)):
+        out[i] = alpha * arr[i] + (1 - alpha) * out[i - 1]
+    return out
+
+
+def _atr(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> np.ndarray:
+    if _HAS_EXTERNAL_ATR:
+        try:
+            df_local = pd.DataFrame({"High": high, "Low": low, "Close": close})
+            return np.asarray(_atr_external(df_local, period))
+        except Exception:
+            pass
+    prev_close = np.concatenate(([close[0]], close[:-1]))
+    tr = np.maximum.reduce([
+        high - low,
+        np.abs(high - prev_close),
+        np.abs(low - prev_close),
+    ])
+    out = np.empty_like(tr, dtype=float)
+    out[: period] = np.nan
+    if len(tr) >= period:
+        out[period - 1] = np.mean(tr[:period])
+        for i in range(period, len(tr)):
+            out[i] = (out[i - 1] * (period - 1) + tr[i]) / period
+    return out
+
+
+# ============================================================================
+# Pivot detection
+# ============================================================================
+
+def _find_pivots(arr: np.ndarray, lookback: int = 5, kind: str = "high") -> list[int]:
+    """Return indices of pivot highs (or lows) using a symmetric N-bar window."""
+    pivots: list[int] = []
+    for i in range(lookback, len(arr) - lookback):
+        window = arr[i - lookback : i + lookback + 1]
+        if kind == "high" and arr[i] == window.max():
+            pivots.append(i)
+        elif kind == "low" and arr[i] == window.min():
+            pivots.append(i)
+    return pivots
+
+
+# ============================================================================
+# Trend regime detection
+# ============================================================================
+
+def _detect_regime(closes: np.ndarray, ema50: np.ndarray) -> str:
+    """
+    Classify the recent market structure as 'uptrend', 'downtrend', or 'range'.
+
+    Heuristic: slope of EMA50 over the last ~30 bars + price position.
+    """
+    n = len(closes)
+    if n < 60:
+        return "range"
+
+    recent_ema = ema50[-30:]
+    slope = (recent_ema[-1] - recent_ema[0]) / max(abs(recent_ema[0]), 1e-9)
+
+    last_price = closes[-1]
+    last_ema = ema50[-1]
+    above_ema = last_price > last_ema
+
+    # Slope thresholds: ~3% over 30 bars = clear trend
+    if slope > 0.03 and above_ema:
+        return "uptrend"
+    if slope < -0.03 and not above_ema:
+        return "downtrend"
+    return "range"
+
+
+# ============================================================================
+# Trendline candidate fitting
+# ============================================================================
+
+def _fit_line(p1_idx: int, p1_val: float, p2_idx: int, p2_val: float):
+    """Return slope, intercept for a line through two points."""
+    if p2_idx == p1_idx:
+        return 0.0, p1_val
+    slope = (p2_val - p1_val) / (p2_idx - p1_idx)
+    intercept = p1_val - slope * p1_idx
+    return slope, intercept
+
+
+def _line_y(x: float, slope: float, intercept: float) -> float:
+    return slope * x + intercept
+
+
+def _count_touches(
+    pivots: list[int],
+    pivot_vals: np.ndarray,
+    slope: float,
+    intercept: float,
+    tolerance: float,
+) -> list[int]:
+    """Return indices of pivots that lie within `tolerance` of the line."""
+    return [p for p in pivots if abs(pivot_vals[p] - _line_y(p, slope, intercept)) <= tolerance]
+
+
+def _best_diagonal_line(
+    pivots: list[int],
+    pivot_vals: np.ndarray,
+    n_bars: int,
+    atr_recent: float,
+    min_span_bars: int = 60,
+    min_touches: int = 3,
+    last_touch_within: int = 40,
+):
+    """
+    Search for the best diagonal trendline through the given pivots.
+
+    Returns dict with keys: slope, intercept, touches (list of indices),
+    span, last_touch, score. Or None if no qualifying line found.
+
+    Scoring prefers:
+      1. Longer span (longer-term lines weighted higher per user preference)
+      2. More touches
+      3. More recent last touch
+    """
+    if len(pivots) < 2:
+        return None
+
+    tolerance = max(atr_recent * 0.6, 1e-6)
+    best = None
+
+    # Try every pair as the line definition; check how many other pivots touch
+    for i in range(len(pivots)):
+        for j in range(i + 1, len(pivots)):
+            p1, p2 = pivots[i], pivots[j]
+            span = p2 - p1
+            if span < min_span_bars:
+                continue
+            slope, intercept = _fit_line(p1, pivot_vals[p1], p2, pivot_vals[p2])
+            touches = _count_touches(pivots, pivot_vals, slope, intercept, tolerance)
+            if len(touches) < min_touches:
+                continue
+            last_touch = touches[-1]
+            if (n_bars - 1) - last_touch > last_touch_within:
+                continue
+
+            # Score: span dominates (per user preference), then touches, then recency
+            score = span * 1.0 + len(touches) * 8.0 - ((n_bars - 1) - last_touch) * 0.5
+
+            if best is None or score > best["score"]:
+                best = {
+                    "slope": slope,
+                    "intercept": intercept,
+                    "touches": touches,
+                    "span": span,
+                    "last_touch": last_touch,
+                    "score": score,
+                    "first_touch": touches[0],
+                }
+    return best
+
+
+def _best_horizontal_level(
+    pivots: list[int],
+    pivot_vals: np.ndarray,
+    n_bars: int,
+    atr_recent: float,
+    min_span_bars: int = 60,
+    min_touches: int = 3,
+    last_touch_within: int = 40,
+):
+    """
+    Find the most-respected horizontal level among the given pivots.
+
+    Clusters pivots by price within ATR tolerance, returns the cluster with
+    the longest span and most touches.
+    """
+    if len(pivots) < 2:
+        return None
+
+    tolerance = max(atr_recent * 0.6, 1e-6)
+    best = None
+
+    for i, p_anchor in enumerate(pivots):
+        level = pivot_vals[p_anchor]
+        cluster = [p for p in pivots if abs(pivot_vals[p] - level) <= tolerance]
+        if len(cluster) < min_touches:
+            continue
+        span = cluster[-1] - cluster[0]
+        if span < min_span_bars:
+            continue
+        last_touch = cluster[-1]
+        if (n_bars - 1) - last_touch > last_touch_within:
+            continue
+
+        # Use mean of cluster values for a smoother level
+        avg_level = float(np.mean([pivot_vals[p] for p in cluster]))
+        score = span * 1.0 + len(cluster) * 8.0 - ((n_bars - 1) - last_touch) * 0.5
+
+        if best is None or score > best["score"]:
+            best = {
+                "level": avg_level,
+                "touches": cluster,
+                "span": span,
+                "last_touch": last_touch,
+                "first_touch": cluster[0],
+                "score": score,
+            }
+    return best
+
+
+# ============================================================================
+# Hero-line selection
+# ============================================================================
+
+def _is_line_relevant(closes, line_y_now: float, atr_recent: float, max_dist_atr: float = 3.0) -> bool:
+    """
+    Strict proximity check used for *broken* lines (where we want the broken
+    level to be near current price). For intact rising support / falling
+    resistance lines, use _is_line_fresh instead — those can be far below/above
+    price legitimately when a stock has trended hard.
+    """
+    return abs(closes[-1] - line_y_now) <= max_dist_atr * atr_recent
+
+
+def _is_line_fresh(candidate: dict, n_bars: int, max_bars_since_touch: int = 30) -> bool:
+    """
+    A diagonal line is 'fresh' if its last touch is recent. This is the right
+    staleness check for intact trendlines — proximity to current price doesn't
+    matter (price can be far from the line in a strong trend), but recency of
+    respect does.
+    """
+    last_touch = candidate.get("last_touch", 0)
+    bars_since = (n_bars - 1) - last_touch
+    return bars_since <= max_bars_since_touch
+
+
+def _select_hero_line(
+    df: pd.DataFrame,
+    regime: str,
+    direction: str,
+    signal_meta: dict,
+):
+    """
+    Decide which line (if any) to draw on this chart, given the regime and signal.
+
+    Selection priority:
+      1. FRESH BREAKOUT (within last 3 bars): broken line is the hero, must be
+         within 3×ATR of price (strict proximity for broken levels).
+      2. INTACT RISING SUPPORT (bullish): green line below price, last touch
+         within 30 bars (freshness, not proximity).
+      3. INTACT FALLING RESISTANCE (bearish): red line above price, last touch
+         within 30 bars.
+      4. None: skip drawing.
+    """
+    highs = df["High"].to_numpy()
+    lows = df["Low"].to_numpy()
+    closes = df["Close"].to_numpy()
+    n = len(df)
+
+    atr_arr = _atr(highs, lows, closes, period=14)
+    atr_recent = float(np.nanmean(atr_arr[-20:])) if n >= 20 else float(np.nanmean(atr_arr))
+    if not np.isfinite(atr_recent) or atr_recent <= 0:
+        atr_recent = float(np.std(closes[-20:])) if n >= 20 else 1.0
+
+    pivot_highs = _find_pivots(highs, lookback=5, kind="high")
+    pivot_lows = _find_pivots(lows, lookback=5, kind="low")
+
+    is_bullish = direction == "bullish"
+    tl_breakout = bool(signal_meta.get("tl_breakout", False))
+
+    # ============================================================
+    # 1. FRESH BREAKOUT (within last 3 bars) — bullish reversal/breakout
+    # ============================================================
+    if is_bullish and tl_breakout:
+        diag = _best_diagonal_line(pivot_highs, highs, n, atr_recent)
+        if diag and diag["slope"] < 0:
+            breakout_bar = _find_breakout_bar(closes, diag["slope"], diag["intercept"], "above", lookback=3)
+            if breakout_bar is not None:
+                line_now = _line_y(n - 1, diag["slope"], diag["intercept"])
+                if _is_line_relevant(closes, line_now, atr_recent):
+                    return _make_hero("diagonal", "resistance", True, breakout_bar,
+                                      "#2e7d32", diag, atr_recent,
+                                      f"Resistance broken ({len(diag['touches'])}t, {diag['span']} bars)")
+        horiz = _best_horizontal_level(pivot_highs, highs, n, atr_recent)
+        if horiz:
+            breakout_bar = _find_horizontal_break(closes, horiz["level"], "above", lookback=3)
+            if breakout_bar is not None:
+                if _is_line_relevant(closes, horiz["level"], atr_recent):
+                    return _make_hero_horiz("resistance", True, breakout_bar,
+                                             "#2e7d32", horiz,
+                                             f"Resistance broken ({len(horiz['touches'])}t, {horiz['span']} bars)")
+
+    # ============================================================
+    # 2. FRESH BREAKDOWN (within last 3 bars) — bearish
+    # ============================================================
+    if not is_bullish and tl_breakout:
+        diag = _best_diagonal_line(pivot_lows, lows, n, atr_recent)
+        if diag and diag["slope"] > 0:
+            breakout_bar = _find_breakout_bar(closes, diag["slope"], diag["intercept"], "below", lookback=3)
+            if breakout_bar is not None:
+                line_now = _line_y(n - 1, diag["slope"], diag["intercept"])
+                if _is_line_relevant(closes, line_now, atr_recent):
+                    return _make_hero("diagonal", "support", True, breakout_bar,
+                                      "#c62828", diag, atr_recent,
+                                      f"Support broken ({len(diag['touches'])}t, {diag['span']} bars)")
+        horiz = _best_horizontal_level(pivot_lows, lows, n, atr_recent)
+        if horiz:
+            breakout_bar = _find_horizontal_break(closes, horiz["level"], "below", lookback=3)
+            if breakout_bar is not None:
+                if _is_line_relevant(closes, horiz["level"], atr_recent):
+                    return _make_hero_horiz("support", True, breakout_bar,
+                                             "#c62828", horiz,
+                                             f"Support broken ({len(horiz['touches'])}t, {horiz['span']} bars)")
+
+    # ============================================================
+    # 3. INTACT RISING SUPPORT (bullish) — works in uptrend OR range
+    # Filter by FRESHNESS (last touch recent), not proximity. A strong
+    # trend can leave price far above the line — that's fine, the line
+    # is still where pullbacks would test.
+    # ============================================================
+    if is_bullish:
+        diag = _best_diagonal_line(pivot_lows, lows, n, atr_recent)
+        if diag and diag["slope"] > 0:
+            current_line_y = _line_y(n - 1, diag["slope"], diag["intercept"])
+            if closes[-1] > current_line_y and _is_line_fresh(diag, n):
+                return _make_hero("diagonal", "support", False, None,
+                                  "#2e7d32", diag, atr_recent,
+                                  f"Rising support ({len(diag['touches'])}t, {diag['span']} bars)")
+
+    # ============================================================
+    # 4. INTACT FALLING RESISTANCE (bearish) — works in downtrend OR range
+    # ============================================================
+    if not is_bullish:
+        diag = _best_diagonal_line(pivot_highs, highs, n, atr_recent)
+        if diag and diag["slope"] < 0:
+            current_line_y = _line_y(n - 1, diag["slope"], diag["intercept"])
+            if closes[-1] < current_line_y and _is_line_fresh(diag, n):
+                return _make_hero("diagonal", "resistance", False, None,
+                                  "#c62828", diag, atr_recent,
+                                  f"Falling resistance ({len(diag['touches'])}t, {diag['span']} bars)")
+
+    # 5. Nothing qualifies
+    return None
+
+
+def _make_hero(kind, role, broken, breakout_bar, color, candidate, atr_recent, label):
+    """Build a hero dict from a diagonal-line candidate."""
+    return {
+        "kind": kind,
+        "role": role,
+        "broken": broken,
+        "breakout_bar": breakout_bar,
+        "color": color,
+        "slope": candidate["slope"],
+        "intercept": candidate["intercept"],
+        "touches": candidate["touches"],
+        "first_touch": candidate["first_touch"],
+        "last_touch": candidate["last_touch"],
+        "span": candidate["span"],
+        "label": label,
+    }
+
+
+def _make_hero_horiz(role, broken, breakout_bar, color, candidate, label):
+    """Build a hero dict from a horizontal-level candidate."""
+    return {
+        "kind": "horizontal",
+        "role": role,
+        "broken": broken,
+        "breakout_bar": breakout_bar,
+        "color": color,
+        "level": candidate["level"],
+        "touches": candidate["touches"],
+        "first_touch": candidate["first_touch"],
+        "last_touch": candidate["last_touch"],
+        "span": candidate["span"],
+        "label": label,
+    }
+
+
+def diagnose_curation(
+    df: pd.DataFrame,
+    direction: str,
+    signal_meta: Optional[dict] = None,
+) -> dict:
+    """
+    Run the same selection logic as _select_hero_line but return a dict
+    explaining what was found, what was considered, and what was chosen.
+
+    Useful for debugging why a chart shows "No clear structure".
+    """
+    if signal_meta is None:
+        signal_meta = {}
+
+    out: dict = {
+        "n_bars": len(df),
+        "direction": direction,
+        "tl_breakout_input": bool(signal_meta.get("tl_breakout", False)),
+    }
+
+    if len(df) < 30:
+        out["error"] = "insufficient_bars"
+        return out
+
+    highs = df["High"].to_numpy(dtype=float)
+    lows = df["Low"].to_numpy(dtype=float)
+    closes = df["Close"].to_numpy(dtype=float)
+    n = len(df)
+
+    # Indicators / regime
+    ema50 = _ema(closes, 50) if n >= 50 else _ema(closes, max(5, n // 4))
+    regime = _detect_regime(closes, ema50)
+    out["regime"] = regime
+
+    atr_arr = _atr(highs, lows, closes, period=14)
+    atr_recent = float(np.nanmean(atr_arr[-20:])) if n >= 20 else float(np.nanmean(atr_arr))
+    if not np.isfinite(atr_recent) or atr_recent <= 0:
+        atr_recent = float(np.std(closes[-20:])) if n >= 20 else 1.0
+    out["atr_recent"] = round(atr_recent, 4)
+    out["touch_tolerance_used"] = round(atr_recent * 0.6, 4)
+
+    # Pivot counts
+    pivot_highs = _find_pivots(highs, lookback=5, kind="high")
+    pivot_lows = _find_pivots(lows, lookback=5, kind="low")
+    out["pivot_highs_count"] = len(pivot_highs)
+    out["pivot_lows_count"] = len(pivot_lows)
+    out["pivot_highs_indices"] = [int(x) for x in pivot_highs[-10:]]  # last 10 only
+    out["pivot_lows_indices"] = [int(x) for x in pivot_lows[-10:]]
+
+    # Best candidate lines (for inspection)
+    best_diag_high = _best_diagonal_line(pivot_highs, highs, n, atr_recent)
+    best_diag_low = _best_diagonal_line(pivot_lows, lows, n, atr_recent)
+    best_horiz_high = _best_horizontal_level(pivot_highs, highs, n, atr_recent)
+    best_horiz_low = _best_horizontal_level(pivot_lows, lows, n, atr_recent)
+
+    def _summarize_diag(d, kind):
+        if d is None:
+            return {"found": False}
+        return {
+            "found": True,
+            "kind": kind,
+            "slope": round(d["slope"], 4),
+            "span": d["span"],
+            "touches_count": len(d["touches"]),
+            "first_touch_bar": d["first_touch"],
+            "last_touch_bar": d["last_touch"],
+            "score": round(d["score"], 2),
+        }
+
+    def _summarize_horiz(h):
+        if h is None:
+            return {"found": False}
+        return {
+            "found": True,
+            "kind": "horizontal",
+            "level": round(h["level"], 2),
+            "span": h["span"],
+            "touches_count": len(h["touches"]),
+            "first_touch_bar": h["first_touch"],
+            "last_touch_bar": h["last_touch"],
+            "score": round(h["score"], 2),
+        }
+
+    out["best_diagonal_resistance"] = _summarize_diag(best_diag_high, "diag_high")
+    out["best_diagonal_support"] = _summarize_diag(best_diag_low, "diag_low")
+    out["best_horizontal_resistance"] = _summarize_horiz(best_horiz_high)
+    out["best_horizontal_support"] = _summarize_horiz(best_horiz_low)
+
+    # Run actual selection
+    hero = _select_hero_line(df, regime, direction, signal_meta)
+    if hero is None:
+        out["chosen"] = None
+        out["chosen_reason"] = "no_qualifying_line"
+        # Explain why each candidate was rejected
+        rejection_reasons = []
+        for name, candidate in [
+            ("diag_resistance", best_diag_high),
+            ("diag_support", best_diag_low),
+            ("horiz_resistance", best_horiz_high),
+            ("horiz_support", best_horiz_low),
+        ]:
+            if candidate is None:
+                rejection_reasons.append(f"{name}: none qualifying (span/touches/recency)")
+            else:
+                # Check why it wasn't selected even though it qualified individually
+                if name.startswith("diag_resistance") and candidate["slope"] >= 0:
+                    rejection_reasons.append(f"{name}: slope not negative ({candidate['slope']:.4f})")
+                elif name.startswith("diag_support") and candidate["slope"] <= 0:
+                    rejection_reasons.append(f"{name}: slope not positive ({candidate['slope']:.4f})")
+                else:
+                    rejection_reasons.append(
+                        f"{name}: candidate exists but not selected for direction={direction} regime={regime}"
+                    )
+        out["rejection_reasons"] = rejection_reasons
+    else:
+        out["chosen"] = {
+            "kind": hero["kind"],
+            "role": hero["role"],
+            "broken": hero["broken"],
+            "breakout_bar": hero["breakout_bar"],
+            "span": hero["span"],
+            "touches_count": len(hero["touches"]),
+            "color": hero["color"],
+            "label": hero["label"],
+        }
+
+    return out
+
+
+def _find_breakout_bar(closes, slope, intercept, direction: str, lookback: int = 3) -> Optional[int]:
+    """First bar in the last `lookback` bars where close crosses the line.
+
+    For monetizable signals, only fresh breakouts (within the last 3 bars by
+    default) should be tagged as 'TL BREAKOUT'. Older breakouts are stale —
+    the move is already gone and subscribers can't act on it.
+    """
+    n = len(closes)
+    start = max(1, n - lookback)
+    for i in range(start, n):
+        prev_y = _line_y(i - 1, slope, intercept)
+        curr_y = _line_y(i, slope, intercept)
+        if direction == "above" and closes[i] > curr_y and closes[i - 1] <= prev_y:
+            return i
+        if direction == "below" and closes[i] < curr_y and closes[i - 1] >= prev_y:
+            return i
+    return None
+
+
+def _find_horizontal_break(closes, level, direction: str, lookback: int = 3) -> Optional[int]:
+    """First bar in the last `lookback` bars where close crosses the level."""
+    n = len(closes)
+    start = max(1, n - lookback)
+    for i in range(start, n):
+        if direction == "above" and closes[i] > level and closes[i - 1] <= level:
+            return i
+        if direction == "below" and closes[i] < level and closes[i - 1] >= level:
+            return i
+    return None
+
+
+def _was_recently_broken(closes, slope, intercept, direction: str, lookback: int = 30) -> Optional[int]:
+    """Find a *historical* break within the last `lookback` bars (used to detect
+    stocks that broke out a while ago and are now in continuation mode)."""
+    n = len(closes)
+    start = max(1, n - lookback)
+    for i in range(start, n):
+        prev_y = _line_y(i - 1, slope, intercept)
+        curr_y = _line_y(i, slope, intercept)
+        if direction == "above" and closes[i] > curr_y and closes[i - 1] <= prev_y:
+            return i
+        if direction == "below" and closes[i] < curr_y and closes[i - 1] >= prev_y:
+            return i
+    return None
+
+
+def _was_recently_broken_horiz(closes, level, direction: str, lookback: int = 30) -> Optional[int]:
+    n = len(closes)
+    start = max(1, n - lookback)
+    for i in range(start, n):
+        if direction == "above" and closes[i] > level and closes[i - 1] <= level:
+            return i
+        if direction == "below" and closes[i] < level and closes[i - 1] >= level:
+            return i
+    return None
+
+
+# ============================================================================
+# Drawing
+# ============================================================================
+
+def _draw_candles(ax, opens, highs, lows, closes):
+    n = len(closes)
+    for i in range(n):
+        c = "#26a69a" if closes[i] >= opens[i] else "#ef5350"
+        ax.plot([i, i], [lows[i], highs[i]], color=c, linewidth=0.6, alpha=0.9)
+        bl = min(opens[i], closes[i])
+        bh = max(opens[i], closes[i])
+        ax.add_patch(Rectangle(
+            (i - 0.35, bl), 0.7, bh - bl,
+            facecolor=c, edgecolor=c, linewidth=0.5, alpha=0.95
+        ))
+
+
+def _draw_volume(ax, opens, closes, volumes, breakout_bar: Optional[int]):
+    n = len(closes)
+    avg = pd.Series(volumes).rolling(20).mean()
+    cols = ["#26a69a" if closes[i] >= opens[i] else "#ef5350" for i in range(n)]
+    ax.bar(range(n), volumes, color=cols, alpha=0.6, width=0.7)
+    ax.plot(range(n), avg, color="#424242", linewidth=0.9, alpha=0.7, label="20D avg")
+    if breakout_bar is not None and 0 <= breakout_bar < n:
+        ax.bar(
+            [breakout_bar], [volumes[breakout_bar]],
+            color="#1b5e20", alpha=0.95, width=0.7,
+            edgecolor="#1b5e20", linewidth=1.2,
+        )
+        if not np.isnan(avg.iloc[breakout_bar]) and avg.iloc[breakout_bar] > 0:
+            ratio = volumes[breakout_bar] / avg.iloc[breakout_bar]
+            ax.text(
+                breakout_bar, volumes[breakout_bar] * 1.05,
+                f"{ratio:.1f}x",
+                fontsize=8, ha="center", fontweight="bold", color="#1b5e20",
+            )
+    ax.set_ylabel("Volume", fontsize=9)
+    ax.legend(loc="upper left", fontsize=8, frameon=False)
+    ax.grid(True, alpha=0.2)
+
+
+def _draw_hero_line(ax, hero, n, closes):
+    """Draw the chosen hero line on the price axis."""
+    if hero is None:
+        return
+
+    color = hero["color"]
+    line_start = hero["first_touch"]
+
+    if hero["broken"] and hero["breakout_bar"] is not None:
+        line_end = hero["breakout_bar"]
+        faded_end = min(n - 1, hero["breakout_bar"] + 8)
+    else:
+        line_end = n - 1
+        faded_end = min(n - 1, n + 5)  # slight forward extension
+
+    if hero["kind"] == "diagonal":
+        slope, intercept = hero["slope"], hero["intercept"]
+        ax.plot(
+            [line_start, line_end],
+            [_line_y(line_start, slope, intercept), _line_y(line_end, slope, intercept)],
+            color=color, linewidth=2.8, alpha=0.95, label=hero["label"], zorder=5,
+        )
+        if hero["broken"]:
+            ax.plot(
+                [line_end, faded_end],
+                [_line_y(line_end, slope, intercept), _line_y(faded_end, slope, intercept)],
+                color=color, linewidth=1.2, alpha=0.4, linestyle="--", zorder=4,
+            )
+        # Touch markers
+        highs_or_lows = None
+    else:  # horizontal
+        level = hero["level"]
+        ax.plot(
+            [line_start, line_end], [level, level],
+            color=color, linewidth=2.8, alpha=0.95, label=hero["label"], zorder=5,
+        )
+        if hero["broken"]:
+            ax.plot(
+                [line_end, faded_end], [level, level],
+                color=color, linewidth=1.2, alpha=0.4, linestyle="--", zorder=4,
+            )
+
+    # Touch markers (using actual pivot values)
+    for p in hero["touches"]:
+        if hero["kind"] == "diagonal":
+            y = _line_y(p, hero["slope"], hero["intercept"])
+        else:
+            y = hero["level"]
+        ax.scatter(p, y, s=45, color=color, edgecolor="white", linewidth=1.2, zorder=6)
+
+
+def _draw_breakout_marker(ax, hero, closes, n):
+    if hero is None or not hero["broken"] or hero["breakout_bar"] is None:
+        return
+    bb = hero["breakout_bar"]
+    role = hero["role"]
+    is_bullish_break = role == "resistance"  # broken resistance = bullish
+
+    band_color = "#26a69a" if is_bullish_break else "#ef5350"
+    band_alpha = 0.15 if is_bullish_break else 0.18
+    ax.axvspan(bb - 0.5, bb + 0.5, color=band_color, alpha=band_alpha, zorder=1)
+
+    if is_bullish_break:
+        # Arrow from below-left
+        text_x = bb - 8
+        text_y = closes[bb] - max(closes) * 0.04
+        ann_color = "#1b5e20"
+        ann_face = "#e8f5e9"
+        label = f"Breakout\n@ ₹{closes[bb]:.0f}"
+        va = "top"
+        arrow_start = (bb - 8, closes[bb] - max(closes) * 0.025)
+        arrow_end = (bb - 0.5, closes[bb] - max(closes) * 0.005)
+    else:
+        # Arrow from above-left
+        text_x = bb - 8
+        text_y = closes[bb] + max(closes) * 0.04
+        ann_color = "#b71c1c"
+        ann_face = "#ffebee"
+        label = f"Breakdown\n@ ₹{closes[bb]:.0f}"
+        va = "bottom"
+        arrow_start = (bb - 8, closes[bb] + max(closes) * 0.025)
+        arrow_end = (bb - 0.5, closes[bb] + max(closes) * 0.005)
+
+    arrow = FancyArrowPatch(
+        arrow_start, arrow_end,
+        arrowstyle="->", color=ann_color, linewidth=1.8,
+        mutation_scale=18, zorder=7,
+    )
+    ax.add_patch(arrow)
+    ax.text(
+        text_x, text_y, label,
+        fontsize=9, fontweight="bold", color=ann_color,
+        ha="right", va=va,
+        bbox=dict(boxstyle="round,pad=0.4", facecolor=ann_face,
+                  edgecolor=ann_color, linewidth=0.8),
+    )
+
+
+def _draw_edge_ticks(ax, highs, lows, n, direction):
+    """Small 20D high/low markers on the right edge instead of full-width lines."""
+    if n >= 20:
+        h20 = max(highs[-20:])
+        l20 = min(lows[-20:])
+        # 20D high
+        ax.plot([n - 1, n + 2], [h20, h20], color="#9e9e9e",
+                linewidth=0.8, linestyle=":", alpha=0.6)
+        ax.text(n + 2.5, h20, "20D H", fontsize=7, color="#757575", va="center")
+        # 20D low (always show for completeness; especially for bearish)
+        ax.plot([n - 1, n + 2], [l20, l20], color="#9e9e9e",
+                linewidth=0.8, linestyle=":", alpha=0.6)
+        ax.text(n + 2.5, l20, "20D L", fontsize=7, color="#757575", va="center")
+
+
+# ============================================================================
+# Main entry point
+# ============================================================================
+
+def build_chart_bytes(
+    df: pd.DataFrame,
+    symbol: str,
+    last_price: float,
+    pct_change: float,
+    score: int,
+    direction: str,                 # "bullish" | "bearish" | "neutral"
+    signal_meta: Optional[dict] = None,
+) -> bytes:
+    """
+    Build a curated chart and return PNG bytes (no file on disk).
+
+    Matches the in-memory pattern used by alerts/telegram.py.
+    """
+    import io
+    fig = _build_figure(
+        df=df, symbol=symbol, last_price=last_price, pct_change=pct_change,
+        score=score, direction=direction, signal_meta=signal_meta,
+    )
+    if fig is None:
+        # Fallback for too-little data: still build something
+        return _build_simple_fallback_bytes(df, symbol, last_price, pct_change, score, direction)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+def _build_simple_fallback_bytes(df, symbol, last_price, pct_change, score, direction) -> bytes:
+    import io
+    fig, ax = plt.subplots(figsize=(13, 6))
+    fig.patch.set_facecolor("white")
+    opens = df["Open"].to_numpy(dtype=float)
+    highs = df["High"].to_numpy(dtype=float)
+    lows  = df["Low"].to_numpy(dtype=float)
+    closes = df["Close"].to_numpy(dtype=float)
+    _draw_candles(ax, opens, highs, lows, closes)
+    title_color = "#1b5e20" if direction == "bullish" else "#b71c1c" if direction == "bearish" else "#616161"
+    ax.set_title(
+        f"{symbol}  ₹{last_price:.2f} ({pct_change:+.2f}%)  |  {direction.upper()} "
+        f"(Score {score}/100)  |  Insufficient data for curation",
+        fontsize=12, fontweight="bold", color=title_color, pad=12,
+    )
+    ax.grid(True, alpha=0.2)
+    ax.set_ylabel("Price (₹)", fontsize=10)
+    plt.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+def _build_figure(
+    df: pd.DataFrame,
+    symbol: str,
+    last_price: float,
+    pct_change: float,
+    score: int,
+    direction: str,
+    signal_meta: Optional[dict] = None,
+):
+    """Build the matplotlib figure and return it. Returns None if df is too small."""
+    if signal_meta is None:
+        signal_meta = {}
+
+    required = {"Open", "High", "Low", "Close", "Volume"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"build_chart: missing columns {missing}")
+
+    df = df.copy()
+    if not isinstance(df.index, pd.RangeIndex):
+        df_dates = df.index
+    else:
+        df_dates = pd.date_range(end=pd.Timestamp.today(), periods=len(df), freq="B")
+
+    opens = df["Open"].to_numpy(dtype=float)
+    highs = df["High"].to_numpy(dtype=float)
+    lows  = df["Low"].to_numpy(dtype=float)
+    closes = df["Close"].to_numpy(dtype=float)
+    volumes = df["Volume"].to_numpy(dtype=float)
+    n = len(df)
+
+    if n < 30:
+        return None
+
+    ema5 = _ema(closes, 5)
+    ema50 = _ema(closes, 50) if n >= 50 else _ema(closes, max(5, n // 4))
+
+    regime = _detect_regime(closes, ema50)
+    hero = _select_hero_line(df, regime, direction, signal_meta)
+
+    fig, (ax_p, ax_v) = plt.subplots(
+        2, 1, figsize=(13, 7),
+        gridspec_kw={"height_ratios": [4, 1]}, sharex=True,
+    )
+    fig.patch.set_facecolor("white")
+
+    _draw_candles(ax_p, opens, highs, lows, closes)
+    ax_p.plot(range(n), ema5, color="#5c6bc0", linewidth=0.9, alpha=0.5, label="EMA 5")
+    ax_p.plot(range(n), ema50, color="#ff9800", linewidth=1.2, alpha=0.6, label="EMA 50")
+
+    _draw_hero_line(ax_p, hero, n, closes)
+    _draw_breakout_marker(ax_p, hero, closes, n)
+    _draw_edge_ticks(ax_p, highs, lows, n, direction)
+
+    if hero is None:
+        ax_p.text(
+            0.99, 0.02,
+            "No qualifying trendline (60+ bar span, 3+ touches, alive)",
+            transform=ax_p.transAxes, fontsize=8.5, color="#757575",
+            ha="right", va="bottom", style="italic",
+            bbox=dict(boxstyle="round,pad=0.4", facecolor="#fafafa",
+                      edgecolor="#bdbdbd", linewidth=0.6),
+        )
+
+    breakout_bar = hero["breakout_bar"] if (hero and hero["broken"]) else None
+    _draw_volume(ax_v, opens, closes, volumes, breakout_bar)
+
+    if direction == "bullish":
+        title_color = "#1b5e20"
+        dir_emoji = "📈"
+    elif direction == "bearish":
+        title_color = "#b71c1c"
+        dir_emoji = "📉"
+    else:
+        title_color = "#616161"
+        dir_emoji = "➡"
+
+    suffix = ""
+    if hero and hero["broken"]:
+        if hero["role"] == "resistance":
+            suffix = f"  |  TL BREAKOUT ({hero['span']}-bar resistance)"
+        else:
+            suffix = f"  |  BREAKDOWN ({hero['span']}-bar support)"
+    elif hero and not hero["broken"]:
+        suffix = f"  |  {hero['label']} intact"
+    else:
+        suffix = "  |  No clear structure"
+
+    title = (
+        f"{symbol}  ₹{last_price:.2f} ({pct_change:+.2f}%)  "
+        f"|  {dir_emoji} {direction.upper()} (Score {score}/100){suffix}"
+    )
+    ax_p.set_title(title, fontsize=12, fontweight="bold", color=title_color, pad=12)
+
+    ax_p.legend(loc="upper left", fontsize=9, frameon=False)
+    ax_p.grid(True, alpha=0.2)
+    ax_p.set_ylabel("Price (₹)", fontsize=10)
+    ax_p.set_xlim(-2, n + 8)
+
+    tick_positions = list(range(0, n, max(1, n // 10)))
+    try:
+        tick_labels = [pd.Timestamp(df_dates[i]).strftime("%b %d") for i in tick_positions]
+    except Exception:
+        tick_labels = [str(i) for i in tick_positions]
+    ax_v.set_xticks(tick_positions)
+    ax_v.set_xticklabels(tick_labels, rotation=0, fontsize=8)
+
+    plt.tight_layout()
+    return fig
+
+
+def build_chart(
+    df: pd.DataFrame,
+    symbol: str,
+    last_price: float,
+    pct_change: float,
+    score: int,
+    direction: str,                 # "bullish" | "bearish" | "neutral"
+    signal_meta: Optional[dict] = None,
+    out_dir: str = "/tmp",
+) -> str:
+    """
+    Build a curated chart and save it as PNG. Returns the absolute path.
+
+    See module docstring for parameter details.
+    """
+    if signal_meta is None:
+        signal_meta = {}
+
+    # Defensive: required columns
+    required = {"Open", "High", "Low", "Close", "Volume"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"build_chart: missing columns {missing}")
+
+    # Reset to integer-indexed for plotting
+    df = df.copy()
+    if not isinstance(df.index, pd.RangeIndex):
+        df_dates = df.index
+    else:
+        df_dates = pd.date_range(end=pd.Timestamp.today(), periods=len(df), freq="B")
+
+    opens = df["Open"].to_numpy(dtype=float)
+    highs = df["High"].to_numpy(dtype=float)
+    lows = df["Low"].to_numpy(dtype=float)
+    closes = df["Close"].to_numpy(dtype=float)
+    volumes = df["Volume"].to_numpy(dtype=float)
+    n = len(df)
+
+    if n < 30:
+        # Not enough data to do any meaningful curation; bail out with simple chart
+        return _build_simple_fallback_chart(
+            df_dates, opens, highs, lows, closes, volumes,
+            symbol, last_price, pct_change, score, direction, out_dir
+        )
+
+    # ---- Indicators ----
+    ema5 = _ema(closes, 5)
+    ema50 = _ema(closes, 50) if n >= 50 else _ema(closes, max(5, n // 4))
+
+    # ---- Regime + hero line ----
+    regime = _detect_regime(closes, ema50)
+    hero = _select_hero_line(df, regime, direction, signal_meta)
+
+    # ---- Build figure ----
+    fig, (ax_p, ax_v) = plt.subplots(
+        2, 1, figsize=(13, 7),
+        gridspec_kw={"height_ratios": [4, 1]}, sharex=True,
+    )
+    fig.patch.set_facecolor("white")
+
+    _draw_candles(ax_p, opens, highs, lows, closes)
+    ax_p.plot(range(n), ema5, color="#5c6bc0", linewidth=0.9, alpha=0.5, label="EMA 5")
+    ax_p.plot(range(n), ema50, color="#ff9800", linewidth=1.2, alpha=0.6, label="EMA 50")
+
+    _draw_hero_line(ax_p, hero, n, closes)
+    _draw_breakout_marker(ax_p, hero, closes, n)
+    _draw_edge_ticks(ax_p, highs, lows, n, direction)
+
+    # No-line annotation
+    if hero is None:
+        ax_p.text(
+            0.99, 0.02,
+            "No qualifying trendline (60+ bar span, 3+ touches, alive)",
+            transform=ax_p.transAxes, fontsize=8.5, color="#757575",
+            ha="right", va="bottom", style="italic",
+            bbox=dict(boxstyle="round,pad=0.4", facecolor="#fafafa",
+                      edgecolor="#bdbdbd", linewidth=0.6),
+        )
+
+    # Volume panel
+    breakout_bar = hero["breakout_bar"] if (hero and hero["broken"]) else None
+    _draw_volume(ax_v, opens, closes, volumes, breakout_bar)
+
+    # ---- Title ----
+    if direction == "bullish":
+        title_color = "#1b5e20"
+        dir_emoji = "📈"
+    elif direction == "bearish":
+        title_color = "#b71c1c"
+        dir_emoji = "📉"
+    else:
+        title_color = "#616161"
+        dir_emoji = "➡"
+
+    suffix = ""
+    if hero and hero["broken"]:
+        if hero["role"] == "resistance":
+            suffix = f"  |  TL BREAKOUT ({hero['span']}-bar resistance)"
+        else:
+            suffix = f"  |  BREAKDOWN ({hero['span']}-bar support)"
+    elif hero and not hero["broken"]:
+        suffix = f"  |  {hero['label']} intact"
+    else:
+        suffix = "  |  No clear structure"
+
+    title = (
+        f"{symbol}  ₹{last_price:.2f} ({pct_change:+.2f}%)  "
+        f"|  {dir_emoji} {direction.upper()} (Score {score}/100){suffix}"
+    )
+    ax_p.set_title(title, fontsize=12, fontweight="bold", color=title_color, pad=12)
+
+    ax_p.legend(loc="upper left", fontsize=9, frameon=False)
+    ax_p.grid(True, alpha=0.2)
+    ax_p.set_ylabel("Price (₹)", fontsize=10)
+    ax_p.set_xlim(-2, n + 8)
+
+    # x-axis dates
+    tick_positions = list(range(0, n, max(1, n // 10)))
+    try:
+        tick_labels = [pd.Timestamp(df_dates[i]).strftime("%b %d") for i in tick_positions]
+    except Exception:
+        tick_labels = [str(i) for i in tick_positions]
+    ax_v.set_xticks(tick_positions)
+    ax_v.set_xticklabels(tick_labels, rotation=0, fontsize=8)
+
+    plt.tight_layout()
+
+    # Save
+    safe_symbol = symbol.replace("/", "_").replace(".", "_")
+    out_path = os.path.join(out_dir, f"chart_{safe_symbol}.png")
+    plt.savefig(out_path, dpi=120, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return out_path
+
+
+def _build_simple_fallback_chart(
+    df_dates, opens, highs, lows, closes, volumes,
+    symbol, last_price, pct_change, score, direction, out_dir,
+) -> str:
+    """Minimal chart for stocks with too little data for curation logic."""
+    fig, ax = plt.subplots(figsize=(13, 6))
+    fig.patch.set_facecolor("white")
+    _draw_candles(ax, opens, highs, lows, closes)
+    title_color = "#1b5e20" if direction == "bullish" else "#b71c1c" if direction == "bearish" else "#616161"
+    ax.set_title(
+        f"{symbol}  ₹{last_price:.2f} ({pct_change:+.2f}%)  |  {direction.upper()} "
+        f"(Score {score}/100)  |  Insufficient data for curation",
+        fontsize=12, fontweight="bold", color=title_color, pad=12,
+    )
+    ax.grid(True, alpha=0.2)
+    ax.set_ylabel("Price (₹)", fontsize=10)
+    plt.tight_layout()
+    safe_symbol = symbol.replace("/", "_").replace(".", "_")
+    out_path = os.path.join(out_dir, f"chart_{safe_symbol}.png")
+    plt.savefig(out_path, dpi=120, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return out_path
