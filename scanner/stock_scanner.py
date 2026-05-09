@@ -417,18 +417,48 @@ def run_stock_scan(symbols: list[str], send_alerts: bool = False) -> dict:
     log.info(f"After cooldown: {len(fresh_bullish)} new bullish, {len(fresh_bearish)} new bearish")
 
     # ---- Apply classification filter (only breakouts / breakdowns / pullbacks alert) ----
-    alert_bullish = [r for r in fresh_bullish if r.classification in ALERT_CATEGORIES]
-    alert_bearish = [r for r in fresh_bearish if r.classification in ALERT_CATEGORIES]
-    skipped_bullish = [r for r in fresh_bullish if r.classification not in ALERT_CATEGORIES]
-    skipped_bearish = [r for r in fresh_bearish if r.classification not in ALERT_CATEGORIES]
+    # ---- Plus: BB challenge filter — bullish must have BB Upper, bearish must have BB Lower
+    def _passes_bb_filter(r: SignalResult) -> bool:
+        if r.direction == "Bullish":
+            return r.bb_pos == "Upper"
+        if r.direction == "Bearish":
+            return r.bb_pos == "Lower"
+        return False
+
+    alert_bullish = [
+        r for r in fresh_bullish
+        if r.classification in ALERT_CATEGORIES and _passes_bb_filter(r)
+    ]
+    alert_bearish = [
+        r for r in fresh_bearish
+        if r.classification in ALERT_CATEGORIES and _passes_bb_filter(r)
+    ]
+
+    # Build the skipped lists with reasons (for logging)
+    skipped_bullish = []
+    for r in fresh_bullish:
+        if r.classification not in ALERT_CATEGORIES:
+            r.classification_reason = f"not actionable ({r.classification})"
+            skipped_bullish.append(r)
+        elif not _passes_bb_filter(r):
+            r.classification_reason = f"BB not Upper (got {r.bb_pos})"
+            skipped_bullish.append(r)
+    skipped_bearish = []
+    for r in fresh_bearish:
+        if r.classification not in ALERT_CATEGORIES:
+            r.classification_reason = f"not actionable ({r.classification})"
+            skipped_bearish.append(r)
+        elif not _passes_bb_filter(r):
+            r.classification_reason = f"BB not Lower (got {r.bb_pos})"
+            skipped_bearish.append(r)
 
     log.info(
-        f"After classification filter: {len(alert_bullish)} bullish alerts "
+        f"After classification + BB filter: {len(alert_bullish)} bullish alerts "
         f"({len(skipped_bullish)} skipped), {len(alert_bearish)} bearish alerts "
         f"({len(skipped_bearish)} skipped)"
     )
     for r in skipped_bullish + skipped_bearish:
-        log.info(f"  ⏸  {r.symbol} skipped (class={r.classification}: {r.classification_reason})")
+        log.info(f"  ⏸  {r.symbol} skipped ({r.classification_reason})")
 
     if send_alerts:
         if alert_bullish:
@@ -473,7 +503,12 @@ def run_stock_scan(symbols: list[str], send_alerts: bool = False) -> dict:
                     "symbol": r.symbol,
                     "score": r.score,
                     "classification": r.classification,
-                    "alerted": r.classification in ALERT_CATEGORIES,
+                    "bb_pos": r.bb_pos,
+                    "alerted": (
+                        r.classification in ALERT_CATEGORIES
+                        and ((r.direction == "Bullish" and r.bb_pos == "Upper")
+                             or (r.direction == "Bearish" and r.bb_pos == "Lower"))
+                    ),
                     "reasons": r.reasons,
                 }
                 for r in bullish
@@ -483,7 +518,12 @@ def run_stock_scan(symbols: list[str], send_alerts: bool = False) -> dict:
                     "symbol": r.symbol,
                     "score": r.score,
                     "classification": r.classification,
-                    "alerted": r.classification in ALERT_CATEGORIES,
+                    "bb_pos": r.bb_pos,
+                    "alerted": (
+                        r.classification in ALERT_CATEGORIES
+                        and ((r.direction == "Bullish" and r.bb_pos == "Upper")
+                             or (r.direction == "Bearish" and r.bb_pos == "Lower"))
+                    ),
                     "reasons": r.reasons,
                 }
                 for r in bearish
