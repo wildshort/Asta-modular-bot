@@ -118,26 +118,38 @@ def _approach_check(
     line_value_at_pivot: float,
     closes: np.ndarray,
     role: str,
-    n_check: int = 5,
+    n_check: int = 8,
+    tolerance_atr: float = 0.5,
+    atr_recent: float = 0,
 ) -> bool:
     """
     A touch is valid only if price approached the line from the correct side.
 
-    Resistance: 5 bars before pivot must all be BELOW the line value at that bar
-    Support:    5 bars before pivot must all be ABOVE the line value at that bar
+    Logic: in the prior `n_check` bars, at least one bar must be MEANINGFULLY
+    on the correct side (below for resistance, above for support). This proves
+    price was approaching from the right direction, not running through.
 
-    This eliminates "run-through" touches where price was passing the level
-    rather than respecting it as resistance/support.
+    Why not require ALL prior bars to be on the correct side: the bars
+    immediately before a pivot are often very close to the line value (they're
+    on the way up to the touch). Strict "all below" would reject most real
+    touches. We just need evidence that price came from below (or above).
     """
     if pivot_idx < n_check:
         return False
+    threshold = atr_recent * tolerance_atr if atr_recent > 0 else 0
+    found_evidence = False
     for j in range(1, n_check + 1):
         prior_close = closes[pivot_idx - j]
-        if role == "resistance" and prior_close >= line_value_at_pivot:
-            return False
-        if role == "support" and prior_close <= line_value_at_pivot:
-            return False
-    return True
+        if role == "resistance":
+            # Need at least one bar meaningfully below the line
+            if prior_close < line_value_at_pivot - threshold:
+                found_evidence = True
+                break
+        else:  # support
+            if prior_close > line_value_at_pivot + threshold:
+                found_evidence = True
+                break
+    return found_evidence
 
 
 def _validate_horizontal_touches(
@@ -147,13 +159,14 @@ def _validate_horizontal_touches(
     closes: np.ndarray,
     role: str,
     tolerance: float,
+    atr_recent: float = 0,
 ) -> list[int]:
     """Filter candidate pivots: keep only those that pass approach-direction."""
     valid = []
     for p in candidate_pivots:
         if abs(pivot_vals[p] - level) > tolerance:
             continue
-        if _approach_check(p, level, closes, role):
+        if _approach_check(p, level, closes, role, atr_recent=atr_recent):
             valid.append(p)
     return valid
 
@@ -166,6 +179,7 @@ def _validate_diagonal_touches(
     closes: np.ndarray,
     role: str,
     tolerance: float,
+    atr_recent: float = 0,
 ) -> list[int]:
     """Same as horizontal but the line value varies by bar."""
     valid = []
@@ -173,7 +187,7 @@ def _validate_diagonal_touches(
         line_y = slope * p + intercept
         if abs(pivot_vals[p] - line_y) > tolerance:
             continue
-        if _approach_check(p, line_y, closes, role):
+        if _approach_check(p, line_y, closes, role, atr_recent=atr_recent):
             valid.append(p)
     return valid
 
@@ -231,7 +245,7 @@ def _best_horizontal_level(
                 continue
             # Validate approach direction
             valid = _validate_horizontal_touches(
-                candidates, vals, level, closes, role, tolerance
+                candidates, vals, level, closes, role, tolerance, atr_recent
             )
             if len(valid) < min_touches:
                 continue
@@ -304,7 +318,7 @@ def _best_diagonal_line(
                 intercept = vals[p1] - slope * p1
                 # Validate touches
                 valid = _validate_diagonal_touches(
-                    pivots, vals, slope, intercept, closes, role, tolerance
+                    pivots, vals, slope, intercept, closes, role, tolerance, atr_recent
                 )
                 if len(valid) < min_touches:
                     continue
@@ -461,13 +475,16 @@ def _select_lines(
     signal_meta: dict,
 ):
     """
-    Returns (hero, secondary) — each is dict-with-metadata or None.
+    Returns (hero, secondary, atr_recent) — each line is dict with metadata or None.
 
-    Hero comes first in priority:
-      1. Fresh breakout (line just broken in last 3 bars)
-      2. Intact relevant line (must be alive, validated touches)
+    For BULLISH direction:
+      - First check: is there a resistance line that just broke? -> fresh breakout
+      - If not: is there an intact rising support holding price up? -> continuation/pullback
+      - Both lines (if found) considered as hero candidates per priority rules
 
-    Secondary is drawn only if meaningfully different from hero.
+    For BEARISH direction:
+      - First check: is there a support line that just broke? -> fresh breakdown
+      - If not: is there an intact falling resistance? -> continuation
     """
     highs = df["High"].to_numpy(dtype=float)
     lows = df["Low"].to_numpy(dtype=float)
@@ -483,86 +500,181 @@ def _select_lines(
     pivot_lows = _find_pivots(lows, lookback=5, kind="low")
 
     is_bullish = direction == "bullish"
-    role = "resistance" if is_bullish else "support"
 
-    # Find candidates for both kinds
-    horiz = _best_horizontal_level(
+    # ===== Find ALL candidate lines (resistance AND support) =====
+    # For bullish: we want resistance (just broken or about to be) AND support (rising, intact)
+    # For bearish: we want support (just broken) AND resistance (falling, intact)
+    horiz_resistance = _best_horizontal_level(
         pivot_highs, pivot_lows, highs, lows, closes,
-        role, atr_recent, n,
+        "resistance", atr_recent, n,
     )
-    diag = _best_diagonal_line(
+    diag_resistance = _best_diagonal_line(
         pivot_highs, pivot_lows, highs, lows, closes,
-        role, atr_recent, n,
+        "resistance", atr_recent, n,
+    )
+    horiz_support = _best_horizontal_level(
+        pivot_highs, pivot_lows, highs, lows, closes,
+        "support", atr_recent, n,
+    )
+    diag_support = _best_diagonal_line(
+        pivot_highs, pivot_lows, highs, lows, closes,
+        "support", atr_recent, n,
     )
 
-    # Determine which is hero (per user: horizontal preferred, diagonal can win on more touches)
-    def _wrap(kind, c):
+    def _wrap(kind, role, c):
         if c is None:
             return None
-        return {"kind": kind, **c}
+        return {"kind": kind, "role_str": role, **c}
 
-    horiz_w = _wrap("horizontal", horiz)
-    diag_w = _wrap("diagonal", diag)
+    horiz_res_w = _wrap("horizontal", "resistance", horiz_resistance)
+    diag_res_w = _wrap("diagonal", "resistance", diag_resistance)
+    horiz_sup_w = _wrap("horizontal", "support", horiz_support)
+    diag_sup_w = _wrap("diagonal", "support", diag_support)
 
-    # Check freshness — has either just broken in last 3 bars?
-    breakout_bar = None
-    breakout_kind = None  # which line just broke
     direction_for_break = "above" if is_bullish else "below"
+    role_to_break = "resistance" if is_bullish else "support"
 
-    if horiz_w:
-        h_break = _find_horizontal_break(closes, horiz_w["level"], direction_for_break, lookback=3)
-        if h_break is not None:
-            breakout_bar = h_break
-            breakout_kind = "horizontal"
-    if diag_w and breakout_bar is None:
-        d_break = _find_diagonal_break(
-            closes, diag_w["slope"], diag_w["intercept"], direction_for_break, lookback=3
-        )
-        if d_break is not None:
-            breakout_bar = d_break
-            breakout_kind = "diagonal"
+    # ===== Check for fresh breakout/breakdown =====
+    breakout_bar = None
+    broken_line = None
+    broken_kind = None
 
-    # Decide hero
+    # The "breakable" lines depend on direction
+    if is_bullish:
+        # For bullish breakout, we'd be breaking ABOVE a resistance
+        if horiz_res_w:
+            h_break = _find_horizontal_break(closes, horiz_res_w["level"], "above", lookback=3)
+            if h_break is not None:
+                breakout_bar = h_break
+                broken_line = horiz_res_w
+                broken_kind = "horizontal"
+        if diag_res_w and breakout_bar is None:
+            d_break = _find_diagonal_break(
+                closes, diag_res_w["slope"], diag_res_w["intercept"], "above", lookback=3
+            )
+            if d_break is not None:
+                breakout_bar = d_break
+                broken_line = diag_res_w
+                broken_kind = "diagonal"
+    else:
+        # For bearish breakdown, we'd be breaking BELOW a support
+        if horiz_sup_w:
+            h_break = _find_horizontal_break(closes, horiz_sup_w["level"], "below", lookback=3)
+            if h_break is not None:
+                breakout_bar = h_break
+                broken_line = horiz_sup_w
+                broken_kind = "horizontal"
+        if diag_sup_w and breakout_bar is None:
+            d_break = _find_diagonal_break(
+                closes, diag_sup_w["slope"], diag_sup_w["intercept"], "below", lookback=3
+            )
+            if d_break is not None:
+                breakout_bar = d_break
+                broken_line = diag_sup_w
+                broken_kind = "diagonal"
+
+    # ===== Pick hero =====
     hero = None
     secondary = None
 
     if breakout_bar is not None:
-        # Fresh breakout — that line is the hero
-        if breakout_kind == "horizontal":
-            hero = horiz_w
-            hero["broken"] = True
-            hero["breakout_bar"] = breakout_bar
-        else:
-            hero = diag_w
-            hero["broken"] = True
-            hero["breakout_bar"] = breakout_bar
-    else:
-        # Intact line — pick hero per priority rule
-        # Horizontal preferred, but diagonal can override if it has noticeably more touches
-        if horiz_w and diag_w:
-            diag_touches = len(diag_w["touches"])
-            horiz_touches = len(horiz_w["touches"])
-            if diag_touches > horiz_touches + 2:  # diagonal must have 3+ more touches to override
-                hero = diag_w
-            else:
-                hero = horiz_w
-        elif horiz_w:
-            hero = horiz_w
-        elif diag_w:
-            hero = diag_w
-        if hero:
-            hero["broken"] = False
-            hero["breakout_bar"] = None
+        # Fresh breakout/breakdown — broken line is hero
+        hero = broken_line
+        hero["broken"] = True
+        hero["breakout_bar"] = breakout_bar
 
-    # Pick secondary if meaningfully different
-    if hero and horiz_w and diag_w:
-        candidate = diag_w if hero["kind"] == "horizontal" else horiz_w
-        if _is_meaningfully_different(
-            hero["kind"], hero, candidate["kind"], candidate, n, atr_recent
-        ):
-            secondary = candidate
-            secondary["broken"] = False
-            secondary["breakout_bar"] = None
+        # Secondary: opposite-role line if it exists and is meaningfully different
+        # For bullish breakout: maybe show an intact support below
+        # For bearish breakdown: maybe show an intact resistance above
+        if is_bullish:
+            # If diagonal resistance is hero, secondary could be horizontal resistance (if different)
+            # OR an intact support
+            other_res = horiz_res_w if broken_kind == "diagonal" else diag_res_w
+            if other_res and _is_meaningfully_different(
+                hero["kind"], hero, other_res["kind"], other_res, n, atr_recent
+            ):
+                secondary = other_res
+                secondary["broken"] = False
+                secondary["breakout_bar"] = None
+        else:
+            other_sup = horiz_sup_w if broken_kind == "diagonal" else diag_sup_w
+            if other_sup and _is_meaningfully_different(
+                hero["kind"], hero, other_sup["kind"], other_sup, n, atr_recent
+            ):
+                secondary = other_sup
+                secondary["broken"] = False
+                secondary["breakout_bar"] = None
+    else:
+        # No fresh breakout — look for intact relevant lines
+        # For bullish: rising support (the trend is intact)
+        # For bearish: falling resistance
+        if is_bullish:
+            # Prefer horizontal support if meaningful, else diagonal support
+            # Diagonal rising support is most useful for uptrend
+            candidate_lines = []
+            if diag_sup_w and diag_sup_w["slope"] > 0:
+                # Rising support — line should be below current price
+                line_y_now = diag_sup_w["slope"] * (n - 1) + diag_sup_w["intercept"]
+                if closes[-1] > line_y_now:
+                    candidate_lines.append(diag_sup_w)
+            if horiz_sup_w:
+                # Horizontal support below price
+                if closes[-1] > horiz_sup_w["level"]:
+                    candidate_lines.append(horiz_sup_w)
+
+            # Per user rule: horizontal preferred unless diagonal has noticeably more touches
+            if candidate_lines:
+                if len(candidate_lines) == 1:
+                    hero = candidate_lines[0]
+                else:
+                    # Two candidates
+                    horiz_c = next((c for c in candidate_lines if c["kind"] == "horizontal"), None)
+                    diag_c = next((c for c in candidate_lines if c["kind"] == "diagonal"), None)
+                    if horiz_c and diag_c:
+                        if len(diag_c["touches"]) > len(horiz_c["touches"]) + 2:
+                            hero = diag_c
+                        else:
+                            hero = horiz_c
+                    else:
+                        hero = candidate_lines[0]
+                hero["broken"] = False
+                hero["breakout_bar"] = None
+        else:
+            # Bearish: falling resistance intact
+            candidate_lines = []
+            if diag_res_w and diag_res_w["slope"] < 0:
+                line_y_now = diag_res_w["slope"] * (n - 1) + diag_res_w["intercept"]
+                if closes[-1] < line_y_now:
+                    candidate_lines.append(diag_res_w)
+            if horiz_res_w:
+                if closes[-1] < horiz_res_w["level"]:
+                    candidate_lines.append(horiz_res_w)
+
+            if candidate_lines:
+                if len(candidate_lines) == 1:
+                    hero = candidate_lines[0]
+                else:
+                    horiz_c = next((c for c in candidate_lines if c["kind"] == "horizontal"), None)
+                    diag_c = next((c for c in candidate_lines if c["kind"] == "diagonal"), None)
+                    if horiz_c and diag_c:
+                        if len(diag_c["touches"]) > len(horiz_c["touches"]) + 2:
+                            hero = diag_c
+                        else:
+                            hero = horiz_c
+                    else:
+                        hero = candidate_lines[0]
+                hero["broken"] = False
+                hero["breakout_bar"] = None
+
+        # Pick secondary if there's another candidate that's meaningfully different
+        if hero and len(candidate_lines) > 1:
+            other = next((c for c in candidate_lines if c is not hero), None)
+            if other and _is_meaningfully_different(
+                hero["kind"], hero, other["kind"], other, n, atr_recent
+            ):
+                secondary = other
+                secondary["broken"] = False
+                secondary["breakout_bar"] = None
 
     return hero, secondary, atr_recent
 
@@ -766,15 +878,17 @@ def _draw_edge_ticks(ax, highs, lows, n):
 # Public API
 # ============================================================================
 
-def _enrich_line_meta(line: Optional[dict], role: str, is_bullish: bool):
-    """Add color and role_str fields to a line dict."""
+def _enrich_line_meta(line: Optional[dict], is_bullish: bool):
+    """Add color field. role_str is already set by _select_lines."""
     if line is None:
         return None
+    # Color based on whether this is bullish-relevant or bearish-relevant
+    # For bullish: green for both broken-resistance and intact-support
+    # For bearish: red for both
     if is_bullish:
-        line["color"] = "#2e7d32"  # green for bullish-relevant
+        line["color"] = "#2e7d32"  # green
     else:
-        line["color"] = "#c62828"  # red for bearish-relevant
-    line["role_str"] = role
+        line["color"] = "#c62828"  # red
     return line
 
 
@@ -819,9 +933,8 @@ def _build_figure(
     # Lines
     hero, secondary, atr_recent = _select_lines(df, direction, signal_meta)
     is_bullish = direction == "bullish"
-    role = "resistance" if is_bullish else "support"
-    hero = _enrich_line_meta(hero, role, is_bullish)
-    secondary = _enrich_line_meta(secondary, role, is_bullish)
+    hero = _enrich_line_meta(hero, is_bullish)
+    secondary = _enrich_line_meta(secondary, is_bullish)
 
     # Divergence
     divergence = _detect_rsi_divergence(closes, rsi_vals)
@@ -864,10 +977,14 @@ def _build_figure(
         else:
             event = f"BREAKDOWN ({hero['span']}-bar support)"
     elif hero and not hero.get("broken"):
+        line_role = hero.get("role_str", "support" if is_bullish else "resistance")
         if hero["kind"] == "horizontal":
-            event = f"{role.title()} ({hero['span']}-bar)"
+            event = f"{line_role.title()} ({hero['span']}-bar)"
         else:
-            event = f"{'Rising support' if is_bullish else 'Falling resistance'} ({hero['span']}-bar)"
+            if line_role == "support":
+                event = f"Rising support ({hero['span']}-bar)"
+            else:
+                event = f"Falling resistance ({hero['span']}-bar)"
     else:
         event = "No clear structure"
     title = f"{symbol}  ₹{last_price:.2f} ({pct_change:+.2f}%)  |  {event}"
